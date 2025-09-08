@@ -8,12 +8,14 @@ import tempfile
 import subprocess
 import requests
 from datetime import datetime
+from urllib.parse import urlparse
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import (
     QMessageBox, QProgressDialog, QApplication, QDialog,
     QVBoxLayout, QLabel, QProgressBar
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QUrl
+from PyQt5.QtGui import QDesktopServices
 from version import get_version_info  # 导入版本信息
 import ctypes
 
@@ -54,10 +56,12 @@ class UpdateCheckThread(QThread):
             version_info = response.json()
             logging.debug(f"获取到版本信息: {version_info}")
 
-            # 检查版本信息格式
-            required_fields = ['version', 'force_update', 'filename', 'checksum']
-            if not all(field in version_info for field in required_fields):
-                raise ValueError("版本信息格式不正确")
+            # 检查版本信息格式（支持 download_url 或 filename 二选一）
+            base_required = ['version', 'force_update', 'checksum']
+            if not all(field in version_info for field in base_required):
+                raise ValueError("版本信息缺少必要字段")
+            if not (version_info.get('download_url') or version_info.get('filename')):
+                raise ValueError("版本信息缺少下载地址（download_url 或 filename）")
 
             # 验证更新通道
             if 'channel' in version_info and version_info['channel'] != self.update_channel:
@@ -146,15 +150,27 @@ class UpdateDownloadThread(QThread):
         
     def run(self):
         try:
-            # 构建完整的下载URL
-            download_url = f"{self.url}/files/{self.version_info['filename']}"
+            # 构建下载URL（优先使用后端返回的 download_url）
+            if self.version_info.get('download_url'):
+                download_url = self.version_info['download_url']
+            elif self.version_info.get('filename'):
+                download_url = f"{self.url}/files/{self.version_info['filename']}"
+            else:
+                raise Exception("无有效下载地址")
             logging.info(f"开始下载更新文件: {download_url}")
             
             # 确保保存目录存在
             os.makedirs(self.save_path, exist_ok=True)
             
-            # 构建保存文件路径，确保有.exe扩展名
-            filename = self.version_info['filename']
+            # 构建保存文件路径
+            filename = self.version_info.get('filename')
+            if not filename:
+                try:
+                    parsed = urlparse(download_url)
+                    filename = os.path.basename(parsed.path) or 'khquant_update.exe'
+                except Exception:
+                    filename = 'khquant_update.exe'
+            # 兼容Windows安装器，若无.exe后缀则补上
             if not filename.lower().endswith('.exe'):
                 filename += '.exe'
             save_file = os.path.join(self.save_path, filename)
@@ -283,9 +299,10 @@ class UpdateManager(QObject):
                 "version": "1.0.0",
                 "build_date": "2024-02-20",
                 "channel": "stable",
-                "app_name": "看海量化交易平台"
+                "app_name": "看海量化回测平台"
             }
         
+        # 系列二更新基路径
         self.update_url = "https://khsci.com/khQuant/update"
         self.update_thread = None
         self.download_thread = None
@@ -293,7 +310,7 @@ class UpdateManager(QObject):
     def show_current_version(self):
         """显示当前版本信息"""
         info = (
-            f"{self.version_info.get('app_name', '看海量化交易平台')}\n"
+            f"{self.version_info.get('app_name', '看海量化回测平台')}\n"
             f"版本: {self.current_version}\n"
             f"构建日期: {self.version_info.get('build_date', '2024-02-20')}\n"
             f"更新通道: {self.update_channel}\n"
@@ -353,7 +370,8 @@ class UpdateManager(QObject):
                     'action': 'kh_check_update',
                     'version': current_version,
                     'channel': self.update_channel
-                }
+                },
+                timeout=5
             )
             
             if response.status_code == 200:
@@ -361,6 +379,7 @@ class UpdateManager(QObject):
                 logging.debug(f"服务器响应: {data}")  # 添加日志
                 
                 if data.get('success'):
+                    # 系列二端点返回 { success: true, data: {...} }
                     version_info = data.get('data', {})
                     logging.debug(f"获取到版本信息: {version_info}")  # 添加日志
                     
@@ -401,6 +420,9 @@ class UpdateManager(QObject):
     def _show_update_dialog(self, version_info):
         """显示更新对话框"""
         try:
+            download_url = version_info.get('download_url') or (
+                f"{self.update_url.rstrip('/')}/files/{version_info.get('filename','')}" if version_info.get('filename') else ''
+            )
             # 检查是否为强制更新
             is_force_update = version_info.get('force_update', False)
             
@@ -409,33 +431,54 @@ class UpdateManager(QObject):
                 msg = QMessageBox(self.parent)
                 msg.setIcon(QMessageBox.Warning)
                 msg.setWindowTitle("强制更新")
-                msg.setText(f"发现重要更新 {version_info['version']}\n此更新为强制更新，必须安装才能继续使用。")
-                msg.setInformativeText(f"更新说明：\n{version_info.get('description', '无更新说明')}")
-                msg.setStandardButtons(QMessageBox.Yes)
-                msg.setDefaultButton(QMessageBox.Yes)
+                msg.setTextFormat(Qt.RichText)
+                desc = version_info.get('description', '无更新说明')
+                link_html = f"<br>下载链接：<a href=\"{download_url}\">{download_url}</a>" if download_url else ""
+                msg.setText(f"发现重要更新 {version_info['version']}<br>此更新为强制更新，必须安装才能继续使用。{link_html}")
+                msg.setInformativeText(f"更新说明：\n{desc}")
+                # 添加自定义按钮
+                close_btn = msg.addButton("关闭", QMessageBox.RejectRole)
+                msg.setDefaultButton(close_btn)
                 
                 # 重写关闭事件
                 msg.closeEvent = lambda event: self.handle_force_update_close(event)
-                
+                # 额外按钮：打开下载链接（可选）
+                open_link_btn = None
+                if download_url:
+                    open_link_btn = msg.addButton("打开下载链接", QMessageBox.ActionRole)
+
                 reply = msg.exec_()
-                if reply == QMessageBox.Yes:
-                    self.download_update(version_info)
-                else:
-                    # 强制更新时，如果用户选择不更新，直接退出程序
+                if open_link_btn and msg.clickedButton() == open_link_btn:
+                    try:
+                        QDesktopServices.openUrl(QUrl(download_url))
+                    except Exception:
+                        pass
+                    # 强制更新情况下，打开链接后仍然要求退出程序
                     QApplication.quit()
+                # 无论点击什么按钮，强制更新时都退出程序
+                QApplication.quit()
             else:
                 # 普通更新时的对话框
-                reply = QMessageBox.question(
-                    self.parent,
-                    "发现新版本",
-                    f"发现新版本 {version_info['version']}\n\n"
-                    f"更新说明：\n{version_info.get('description', '无更新说明')}\n\n"
-                    "是否现在更新？",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                
-                if reply == QMessageBox.Yes:
-                    self.download_update(version_info)
+                msg = QMessageBox(self.parent)
+                msg.setIcon(QMessageBox.Information)
+                msg.setWindowTitle("发现新版本")
+                msg.setTextFormat(Qt.RichText)
+                desc = version_info.get('description', '无更新说明')
+                link_html = f"<br>下载链接：<a href=\"{download_url}\">{download_url}</a>" if download_url else ""
+                msg.setText(f"发现新版本 {version_info['version']}{link_html}")
+                msg.setInformativeText(f"更新说明：\n{desc}")
+                later_btn = msg.addButton("稍后", QMessageBox.NoRole)
+                open_link_btn = None
+                if download_url:
+                    open_link_btn = msg.addButton("打开下载链接", QMessageBox.ActionRole)
+                msg.setDefaultButton(later_btn)
+
+                msg.exec_()
+                if open_link_btn and msg.clickedButton() == open_link_btn:
+                    try:
+                        QDesktopServices.openUrl(QUrl(download_url))
+                    except Exception:
+                        pass
             
         except Exception as e:
             logging.error(f"显示更新对话框时出错: {str(e)}", exc_info=True)

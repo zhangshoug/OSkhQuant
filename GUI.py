@@ -8,12 +8,15 @@ import hashlib,threading
 import psutil
 import pandas as pd
 import numpy as np
+import multiprocessing
+import time
+from queue import Empty
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QTextEdit, QPushButton, QFileDialog, QMessageBox, QProgressBar, 
                              QComboBox, QDateEdit, QTimeEdit, QGroupBox, QScrollArea, QCheckBox, QGridLayout,
-                             QDialog,QTabWidget,QSplashScreen,QProgressDialog,QMenu, QStyle)  # 添加QStyle
-from PyQt5.QtCore import  Qt, QThread, pyqtSignal, QDate, QTime, QRect, QTimer,QSettings,QPoint
-from PyQt5.QtGui import QPen,QPixmap,QFont, QIcon, QPalette, QColor, QLinearGradient, QCursor, QPixmap, QPainter
+                             QDialog,QTabWidget,QSplashScreen,QProgressDialog,QMenu, QStyle, QSplitter)  # 添加QStyle和QSplitter
+from PyQt5.QtCore import  Qt, QThread, pyqtSignal, QDate, QTime, QRect, QTimer,QSettings,QPoint, QMutex, QUrl
+from PyQt5.QtGui import QPen,QPixmap,QFont, QIcon, QPalette, QColor, QLinearGradient, QCursor, QPixmap, QPainter, QPainterPath, QDesktopServices
 from khQTTools import download_and_store_data,get_and_save_stock_list, supplement_history_data
 from PyQt5 import QtCore
 import logging
@@ -22,12 +25,32 @@ from GUIplotLoadData import StockDataAnalyzerGUI  # 添加这一行导入
 #from activation_thread import ActivationCheckThread  # 添加这一行
 from update_manager import UpdateManager  # 将之前的UpdateManager类保存在单独的update_manager.py文件中
 from version import get_version_info  # 导入版本信息
+from SettingsDialog import SettingsDialog
 
+# 自定义控件类，禁用滚轮事件
+class NoWheelComboBox(QComboBox):
+    """禁用滚轮事件的QComboBox"""
+    def wheelEvent(self, event):
+        # 忽略滚轮事件，不调用父类的wheelEvent
+        event.ignore()
+
+class NoWheelDateEdit(QDateEdit):
+    """禁用滚轮事件的QDateEdit"""
+    def wheelEvent(self, event):
+        # 忽略滚轮事件，不调用父类的wheelEvent
+        event.ignore()
+
+class NoWheelTimeEdit(QTimeEdit):
+    """禁用滚轮事件的QTimeEdit"""
+    def wheelEvent(self, event):
+        # 忽略滚轮事件，不调用父类的wheelEvent
+        event.ignore()
 
 # 获取当前文件的上级目录
 PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 sys.path.append(PARENT_DIR)
+
 
 LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
 
@@ -64,16 +87,18 @@ class DownloadThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(bool, str)
     error = pyqtSignal(str)  # 添加错误信号
+    status_update = pyqtSignal(str)  # 添加状态更新信号
 
     def __init__(self, params, parent=None):  # 添加parent参数
         super().__init__(parent)
         self.params = params
         self.running = True
+        self.mutex = QMutex()  # 添加互斥锁保护状态
         logging.info(f"初始化下载线程，参数: {params}")
 
     def run(self):
         try:
-            if not self.running:
+            if not self.isRunning():
                 return
                 
             logging.info("下载线程开始运行")
@@ -89,17 +114,34 @@ class DownloadThread(QThread):
                 raise ValueError("字段列表为空")
 
             def progress_callback(percent):
-                if not self.running:
+                # 在每次回调时检查中断标志
+                if not self.isRunning():
+                    logging.info("检测到下载中断标志，抛出中断异常")
                     raise InterruptedError("下载被中断")
                 try:
                     self.progress.emit(percent)
                 except Exception as e:
                     logging.error(f"进度错误: {str(e)}")
 
+            def log_callback(message):
+                # 在每次回调时检查中断标志
+                if not self.isRunning():
+                    logging.info("检测到下载中断标志，抛出中断异常")
+                    raise InterruptedError("下载被中断")
+                try:
+                    self.status_update.emit(message)
+                except Exception as e:
+                    logging.error(f"状态更新错误: {str(e)}")
+
             # 分离指数文件和普通股票文件
             index_files = []
             stock_files = []
             for file_path in self.params['stock_files']:
+                # 处理循环中也检查中断
+                if not self.isRunning():
+                    logging.info("检测到下载中断标志，停止处理")
+                    return
+                    
                 if '指数_股票列表' in file_path:
                     index_files.append(file_path)
                 else:
@@ -109,8 +151,12 @@ class DownloadThread(QThread):
             total_files = len(index_files) + len(stock_files)
             current_progress = 0
 
+            # 创建正确的中断检查函数
+            def check_interrupt():
+                return not self.isRunning()
+
             # 下载指数数据
-            if index_files:
+            if index_files and self.isRunning():
                 try:
                     params_index = {
                         'local_data_path': self.params['local_data_path'],
@@ -119,20 +165,28 @@ class DownloadThread(QThread):
                         'period_type': self.params['period_type'],
                         'start_date': self.params['start_date'],
                         'end_date': self.params['end_date'],
-                        'time_range': self.params.get('time_range', 'all')
+                        'time_range': self.params.get('time_range', 'all'),
+                        'dividend_type': self.params.get('dividend_type', 'none')  # 添加复权参数
                     }
                     # 计算进度的回调函数
                     progress_cb = lambda p: self.progress.emit(
                         int(current_progress * 100 / total_files + p * len(index_files) / total_files)
-                    )
-                    download_and_store_data(**params_index, progress_callback=progress_cb)
+                    ) if self.isRunning() else None
+                    
+                    # 尝试下载指数数据，但在任何时候检查中断
+                    try:
+                        download_and_store_data(**params_index, progress_callback=progress_cb, log_callback=log_callback, check_interrupt=check_interrupt)
+                    except InterruptedError:
+                        logging.info("下载指数数据被中断")
+                        return
+                        
                     current_progress += len(index_files)
                 except Exception as e:
                     logging.error(f"下载指数数据时出错: {str(e)}")
                     raise
 
             # 下载普通股票数据
-            if stock_files:
+            if stock_files and self.isRunning():
                 try:
                     params_stock = {
                         'local_data_path': self.params['local_data_path'],
@@ -141,18 +195,26 @@ class DownloadThread(QThread):
                         'period_type': self.params['period_type'],
                         'start_date': self.params['start_date'],
                         'end_date': self.params['end_date'],
-                        'time_range': self.params.get('time_range', 'all')
+                        'time_range': self.params.get('time_range', 'all'),
+                        'dividend_type': self.params.get('dividend_type', 'none')  # 添加复权参数
                     }
                     # 计算进度的回调函数
                     progress_cb = lambda p: self.progress.emit(
                         int(current_progress * 100 / total_files + p * len(stock_files) / total_files)
-                    )
-                    download_and_store_data(**params_stock, progress_callback=progress_cb)
+                    ) if self.isRunning() else None
+                    
+                    # 尝试下载股票数据，但在任何时候检查中断
+                    try:
+                        download_and_store_data(**params_stock, progress_callback=progress_cb, log_callback=log_callback, check_interrupt=check_interrupt)
+                    except InterruptedError:
+                        logging.info("下载股票数据被中断")
+                        return
+                        
                 except Exception as e:
                     logging.error(f"下载股票数据时出错: {str(e)}")
                     raise
 
-            if self.running:
+            if self.isRunning():
                 self.finished.emit(True, "数据下载完成！")
                 
         except Exception as e:
@@ -161,12 +223,22 @@ class DownloadThread(QThread):
             import traceback
             logging.error(traceback.format_exc())
             
-            if self.running:
+            if self.isRunning():
                 self.error.emit(error_msg)
                 self.finished.emit(False, error_msg)
 
     def stop(self):
+        logging.info("尝试停止下载线程")
+        self.mutex.lock()
         self.running = False
+        self.mutex.unlock()
+        logging.info("已设置下载中断标志")
+        
+    def isRunning(self):
+        self.mutex.lock()
+        result = self.running
+        self.mutex.unlock()
+        return result
 
 def closeEvent(self, event):
         """窗口关闭时的处理"""
@@ -222,6 +294,287 @@ def closeEvent(self, event):
         except Exception as e:
             logging.error(f"程序退出时出错: {str(e)}", exc_info=True)
             event.accept()  # 确保程序能够退出
+
+def supplement_data_worker(params, progress_queue, result_queue, stop_event):
+    """
+    数据补充工作进程函数
+    在独立进程中运行，避免GIL限制
+    """
+    # 多进程保护 - 防止在子进程中启动GUI
+    if __name__ != '__main__':
+        # 在子进程中，确保不会执行主程序代码
+        import multiprocessing
+        multiprocessing.current_process().name = 'GUISupplementWorker'
+    
+    try:
+        # 在子进程中导入需要的模块
+        import sys
+        import os
+        
+        # 延迟导入并捕获任何GUI相关错误
+        try:
+            from khQTTools import supplement_history_data
+        except Exception as import_error:
+            # 如果导入失败，尝试直接从当前目录导入
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            sys.path.insert(0, current_dir)
+            try:
+                from khQTTools import supplement_history_data
+            except:
+                result_queue.put(('error', f"无法导入数据补充模块: {str(import_error)}"))
+                return
+        
+        import logging
+        import time
+        import re
+        
+        # 配置子进程的日志
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        
+        # 进度和状态更新的时间控制
+        last_progress_time = 0
+        last_status_time = 0
+        update_interval = 0.5  # 500毫秒
+        
+        # 统计信息
+        supplement_stats = {
+            'total_stocks': 0,
+            'success_count': 0,
+            'empty_data_count': 0,
+            'error_count': 0,
+            'empty_stocks': []
+        }
+        
+        def progress_callback(percent):
+            nonlocal last_progress_time
+            current_time = time.time()
+            if current_time - last_progress_time >= update_interval or percent >= 100:
+                try:
+                    progress_queue.put(('progress', percent), timeout=1)
+                    last_progress_time = current_time
+                    print(f"[GUI进程] 发送进度: {percent}%")  # 调试信息
+                except Exception as e:
+                    print(f"[GUI进程] 发送进度失败: {e}")
+        
+        def log_callback(message):
+            nonlocal last_status_time
+            current_time = time.time()
+            
+            try:
+                # 处理消息的统计和格式化（修复过滤逻辑）
+                # 检查是否是补充数据的成功消息
+                success_pattern = r"^补充\s+(.*?\.\S+)\s+数据成功"
+                success_match = re.match(success_pattern, message)
+                
+                if success_match:
+                    # 这是成功的补充消息，应该显示出来
+                    stock_code = success_match.group(1)
+                    supplement_stats['success_count'] += 1
+                    
+                    # 直接转发成功消息，不修改格式
+                    progress_queue.put(('status', message), timeout=1)
+                    print(f"[GUI进程] 发送成功状态: {message}")  # 调试信息
+                    return
+                
+                # 检查是否是错误消息
+                error_pattern = r"^补充\s+(.*?\.\S+)\s+数据时出错"
+                error_match = re.match(error_pattern, message)
+                
+                if error_match:
+                    # 这是错误消息，应该显示出来
+                    stock_code = error_match.group(1)
+                    supplement_stats['error_count'] += 1
+                    
+                    # 直接转发错误消息
+                    progress_queue.put(('status', message), timeout=1)
+                    print(f"[GUI进程] 发送错误状态: {message}")  # 调试信息
+                    return
+                
+                # 检查是否是空数据消息
+                empty_pattern = r"^补充\s+(.*?\.\S+)\s+数据成功，但数据为空"
+                empty_match = re.match(empty_pattern, message)
+                
+                if empty_match:
+                    # 这是空数据消息，应该显示出来
+                    stock_code = empty_match.group(1)
+                    supplement_stats['empty_data_count'] += 1
+                    if stock_code not in supplement_stats['empty_stocks']:
+                        supplement_stats['empty_stocks'].append(stock_code)
+                    
+                    # 直接转发空数据消息
+                    progress_queue.put(('status', message), timeout=1)
+                    print(f"[GUI进程] 发送空数据状态: {message}")  # 调试信息
+                    return
+                
+                # 重要消息立即发送
+                is_important = any(keyword in str(message) for keyword in ['开始', '完成', '失败', '错误', '中断'])
+                
+                if is_important or current_time - last_status_time >= update_interval:
+                    try:
+                        progress_queue.put(('status', str(message)), timeout=1)
+                        last_status_time = current_time
+                        print(f"[GUI进程] 发送状态: {message}")  # 调试信息
+                    except Exception as e:
+                        print(f"[GUI进程] 发送状态失败: {e}")
+                        
+            except Exception as e:
+                print(f"[GUI进程] log_callback 处理错误: {e}")
+        
+        def check_interrupt():
+            # 检查停止事件
+            return stop_event.is_set()
+        
+        # 执行数据补充
+        supplement_history_data(
+            stock_files=params['stock_files'],
+            field_list=params['field_list'],
+            period_type=params['period_type'],
+            start_date=params['start_date'],
+            end_date=params['end_date'],
+            time_range=params.get('time_range', 'all'),
+            dividend_type=params.get('dividend_type', 'none'),
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+            check_interrupt=check_interrupt
+        )
+        
+        # 构建详细的完成消息
+        total = supplement_stats['success_count'] + supplement_stats['empty_data_count'] + supplement_stats['error_count']
+        result_message = f"数据补充完成！\n"
+        
+        if supplement_stats['empty_data_count'] > 0:
+            result_message += f"数据为空: {supplement_stats['empty_data_count']} 只股票\n"
+            if len(supplement_stats['empty_stocks']) <= 10:
+                result_message += f"数据为空的股票: {', '.join(supplement_stats['empty_stocks'])}\n"
+            else:
+                result_message += f"数据为空的股票(前10个): {', '.join(supplement_stats['empty_stocks'][:10])}...\n"
+        
+        if supplement_stats['error_count'] > 0:
+            result_message += f"处理出错: {supplement_stats['error_count']} 只股票\n"
+        
+        # 发送完成信号
+        result_queue.put(('success', result_message.strip()))
+        
+    except Exception as e:
+        error_msg = f"补充数据过程中发生错误: {str(e)}"
+        result_queue.put(('error', error_msg))
+        logging.error(error_msg, exc_info=True)
+
+
+# 添加数据补充线程类（现在使用多进程后端）
+class SupplementThread(QThread):
+    """数据补充线程（现在使用多进程后端）"""
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(bool, str)
+    error = pyqtSignal(str)
+    status_update = pyqtSignal(str)
+
+    def __init__(self, params, parent=None):
+        super().__init__(parent)
+        self.params = params
+        self.running = True
+        self.mutex = QMutex()
+        
+        # 在主线程中创建进程间通信队列
+        self.progress_queue = multiprocessing.Queue(maxsize=100)
+        self.result_queue = multiprocessing.Queue()
+        self.stop_event = multiprocessing.Event()
+        self.process = None
+
+    def run(self):
+        try:
+            if not self.isRunning():
+                return
+                
+            # 参数验证
+            if not self.params.get('stock_files'):
+                raise ValueError("股票代码列表为空")
+
+            # 创建并启动子进程
+            self.process = multiprocessing.Process(
+                target=supplement_data_worker,
+                args=(self.params, self.progress_queue, self.result_queue, self.stop_event)
+            )
+            self.process.start()
+            
+            # 在线程中直接监控进程间通信
+            while self.isRunning() and (self.process and self.process.is_alive()):
+                try:
+                    # 检查进度消息
+                    while True:
+                        try:
+                            msg_type, data = self.progress_queue.get_nowait()
+                            if msg_type == 'progress':
+                                print(f"[GUI线程] 接收进度: {data}%")  # 调试信息
+                                self.progress.emit(data)
+                            elif msg_type == 'status':
+                                print(f"[GUI线程] 接收状态: {data}")  # 调试信息
+                                self.status_update.emit(data)
+                        except Empty:
+                            break
+                    
+                    # 检查结果
+                    try:
+                        result_type, message = self.result_queue.get_nowait()
+                        if result_type == 'success':
+                            self.finished.emit(True, message)
+                        else:
+                            self.error.emit(message)
+                        return  # 完成后退出
+                    except Empty:
+                        pass
+                    
+                    # 短暂休眠
+                    self.msleep(100)
+                    
+                except Exception as e:
+                    logging.error(f"监控进程时出错: {str(e)}")
+                    break
+            
+            # 检查进程是否异常退出
+            if self.process and not self.process.is_alive():
+                exit_code = self.process.exitcode
+                if exit_code != 0 and self.isRunning():
+                    self.error.emit(f"数据补充进程异常退出，退出码: {exit_code}")
+                
+        except Exception as e:
+            error_msg = f"启动数据补充进程时发生错误: {str(e)}"
+            logging.error(error_msg, exc_info=True)
+            if self.isRunning():
+                self.error.emit(error_msg)
+                self.finished.emit(False, error_msg)
+
+    def stop(self):
+        """停止数据补充"""
+        self.mutex.lock()
+        self.running = False
+        
+        # 停止多进程
+        try:
+            if self.stop_event:
+                self.stop_event.set()
+                
+            if self.process and self.process.is_alive():
+                # 等待进程结束
+                self.process.join(timeout=5)
+                
+                # 如果进程还没结束，强制终止
+                if self.process.is_alive():
+                    self.process.terminate()
+                    self.process.join(timeout=2)
+                    
+                    if self.process.is_alive():
+                        self.process.kill()
+        except Exception as e:
+            logging.error(f"停止进程时出错: {str(e)}")
+            
+        self.mutex.unlock()
+        
+    def isRunning(self):
+        self.mutex.lock()
+        result = self.running
+        self.mutex.unlock()
+        return result
 
 class StockDataCleaner:
     def __init__(self):
@@ -401,358 +754,6 @@ class StockDataCleaner:
             'deleted_rows': self.deleted_rows
         }
 
-class SettingsDialog(QDialog):
-    """设置对话框类"""
-    #activation_completed = pyqtSignal(bool)
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        #self.activation_manager = ActivationManager()
-        self.settings = QSettings('KHQuant', 'StockAnalyzer')
-        self.confirmed_exit = False
-        
-        # 设置窗口标志
-        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
-        self.setWindowModality(Qt.ApplicationModal)
-        
-        # 如果未激活，显示激活界面，否则显示设置界面
-        # if not self.activation_manager.is_activated():
-        #     self.initActivationUI()
-        # else:
-        #     self.initUI()
-        self.initUI()
-        # 移除这行重复的日志
-        # logging.info("激活对话框初始化完成")
-
-    def initActivationUI(self):
-        """初始化激活界面"""
-        try:
-            # 只在初始化时记录一次日志
-            logging.debug("初始化激活界面")
-            layout = QVBoxLayout(self)
-            
-            # 添加标题
-            title_label = QLabel("软件激活")
-            title_label.setFont(QFont("Roboto", 14, QFont.Bold))
-            title_label.setAlignment(Qt.AlignCenter)
-            layout.addWidget(title_label)
-            
-            # 添加激活码输入框
-            activation_group = QGroupBox("激活信息")
-            activation_layout = QVBoxLayout()
-            
-            # 获取机器码
-            try:
-                machine_code = self.activation_manager.machine_code
-            except Exception as e:
-                logging.error(f"获取机器码失败: {str(e)}")
-                machine_code = "获取失败"
-            
-            machine_code_label = QLabel(f"机器码: {machine_code}")
-            activation_layout.addWidget(machine_code_label)
-            
-            # 激活码输入
-            self.activation_code_input = QLineEdit()
-            self.activation_code_input.setPlaceholderText("请输入激活码")
-            activation_layout.addWidget(self.activation_code_input)
-            
-            # 激活按钮
-            activate_button = QPushButton("激活软件")
-            activate_button.clicked.connect(self.activate_software)
-            activation_layout.addWidget(activate_button)
-            
-            activation_group.setLayout(activation_layout)
-            layout.addWidget(activation_group)
-            
-            # 添加取消按钮
-            cancel_button = QPushButton("取消")
-            cancel_button.clicked.connect(self.reject)
-            layout.addWidget(cancel_button)
-            
-            self.setLayout(layout)
-            self.setMinimumWidth(400)
-            self.setWindowTitle("软件激活")
-            
-        except Exception as e:
-            logging.error(f"初始化软件激活界面错误: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"初始化激活界面时出错: {str(e)}")
-
-    def initUI(self):
-        """设置对话框UI初始化"""
-        self.setWindowTitle('软件设置')
-        self.setMinimumWidth(500)
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
-        
-        # 主布局
-        layout = QVBoxLayout(self)
-        layout.setSpacing(15)  # 增加组件之间的间距
-        
-        # 首先添加股票列表管理组
-        stock_list_group = QGroupBox("股票列表管理")
-        stock_list_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #3D3D3D;
-                border-radius: 5px;
-                margin-top: 12px;
-                padding-top: 15px;
-                color: #E0E0E0;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 7px;
-                padding: 0 3px;
-            }
-        """)
-        stock_list_layout = QVBoxLayout()
-        
-        # 添加更新按钮
-        update_stock_list_btn = QPushButton("更新成分股列表（运行时需耐心等待，无需频繁更新")
-        update_stock_list_btn.clicked.connect(self.update_stock_list)
-        stock_list_layout.addWidget(update_stock_list_btn)
-        
-        stock_list_group.setLayout(stock_list_layout)
-        layout.addWidget(stock_list_group)
-
-        # 客户端路径设置组
-        client_group = QGroupBox("客户端设置")
-        client_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #3D3D3D;
-                border-radius: 5px;
-                margin-top: 12px;
-                padding-top: 15px;
-                color: #E0E0E0;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 7px;
-                padding: 0 3px;
-            }
-        """)
-        path_layout = QVBoxLayout()
-        path_label = QLabel("miniQMT客户端路径:")
-        path_label.setStyleSheet("color: #E0E0E0;")
-        path_layout.addWidget(path_label)
-        
-        # 路径输入和浏览按钮放在单独的水平布局中
-        input_layout = QHBoxLayout()
-        self.client_path_edit = QLineEdit()
-        self.client_path_edit.setMinimumWidth(400)  # 增加宽度
-        default_path = r"C:\国金证券QMT交易端\bin.x64\XtItClient.exe"
-        saved_path = self.settings.value('client_path', default_path)
-        self.client_path_edit.setText(saved_path)
-        self.client_path_edit.setToolTip("请选择miniQMT客户端启动程序XtItClient.exe")
-        self.client_path_edit.setStyleSheet("""
-            QLineEdit {
-                background-color: #2D2D2D;
-                border: 1px solid #3D3D3D;
-                border-radius: 3px;
-                padding: 5px;
-                color: #E0E0E0;
-            }
-        """)
-        
-        browse_button = QPushButton("浏览")
-        browse_button.setFixedWidth(60)
-        browse_button.clicked.connect(self.browse_client)
-        browse_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3D3D3D;
-                color: #E0E0E0;
-                border: none;
-                padding: 5px;
-                border-radius: 3px;
-            }
-            QPushButton:hover {
-                background-color: #4D4D4D;
-            }
-        """)
-        
-        input_layout.addWidget(self.client_path_edit)
-        input_layout.addWidget(browse_button)
-        path_layout.addLayout(input_layout)
-        client_group.setLayout(path_layout)
-        layout.addWidget(client_group)
-        
-        # 版本信息组
-        version_group = QGroupBox("版本信息")
-        version_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #3D3D3D;
-                border-radius: 5px;
-                margin-top: 12px;
-                padding-top: 15px;
-                color: #E0E0E0;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 7px;
-                padding: 0 3px;
-            }
-        """)
-        version_layout = QVBoxLayout()
-        version_info = get_version_info()
-        version_label = QLabel(f"当前版本：v{version_info['version']}")
-        version_label.setStyleSheet("color: #E0E0E0;")
-        version_layout.addWidget(version_label)
-        version_group.setLayout(version_layout)
-        layout.addWidget(version_group)
-        
-        # 底部按钮布局
-        button_layout = QHBoxLayout()
-        
-        # 添加反馈问题按钮（靠左）
-        feedback_button = QPushButton("反馈问题")
-        feedback_button.setFixedWidth(100)
-        feedback_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2D2D2D;
-                color: #E0E0E0;
-                border: none;
-                padding: 5px 15px;
-                border-radius: 2px;
-            }
-            QPushButton:hover {
-                background-color: #3D3D3D;
-            }
-        """)
-        feedback_button.clicked.connect(self.open_feedback_page)
-        button_layout.addWidget(feedback_button)
-        
-        # 添加弹性空间，使保存和关闭按钮靠右
-        button_layout.addStretch()
-        
-        # 保存和关闭按钮（靠右）
-        save_button = QPushButton("保存设置")
-        save_button.setFixedWidth(100)
-        save_button.setStyleSheet("""
-            QPushButton {
-                background-color: #0078D7;
-                color: white;
-                border: none;
-                padding: 5px 15px;
-                border-radius: 2px;
-            }
-            QPushButton:hover {
-                background-color: #1984D8;
-            }
-        """)
-        save_button.clicked.connect(self.save_settings)
-        
-        close_button = QPushButton("关闭")
-        close_button.setFixedWidth(100)
-        close_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3D3D3D;
-                color: #E0E0E0;
-                border: none;
-                padding: 5px 15px;
-                border-radius: 2px;
-            }
-            QPushButton:hover {
-                background-color: #4D4D4D;
-            }
-        """)
-        close_button.clicked.connect(self.close)
-        
-        button_layout.addWidget(save_button)
-        button_layout.addWidget(close_button)
-        
-        layout.addLayout(button_layout)
-        
-        # 设置整体背景色
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #1E1E1E;
-            }
-        """)
-
-    def browse_client(self):
-        """浏览选择客户端路径"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择miniQMT客户端程序",  # 更新这里的提示文字
-            self.client_path_edit.text(),
-            "可执行文件 (*.exe)"
-        )
-        if file_path:
-            self.client_path_edit.setText(file_path)
-            
-    def save_settings(self):
-        """保存设置"""
-        try:
-            client_path = self.client_path_edit.text().strip()
-            if not os.path.exists(client_path):
-                QMessageBox.warning(self, "警告", "指定的客户端路径不存在")
-                return
-                
-            self.settings.setValue('client_path', client_path)
-            QMessageBox.information(self, "成功", "设置已保存")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存设置时出错: {str(e)}")
-
-    # 添加打开反馈页面的方法
-    def open_feedback_page(self):
-        """打开反馈问题页面"""
-        url = "https://khsci.com/khQuant/feedback"
-        import webbrowser
-        webbrowser.open(url)
-
-    # 在 SettingsDialog 类中添加更新股票列表的方法
-    def update_stock_list(self):
-        """更新股票列表"""
-        try:
-            # 禁用按钮
-            update_stock_list_btn = self.findChild(QPushButton, "update_stock_list_btn")
-            if update_stock_list_btn:
-                update_stock_list_btn.setEnabled(False)
-            # 创建进度对话框
-            self.progress_dialog = QProgressDialog("正在更新股票列表...", None, 0, 0, self)
-            self.progress_dialog.setWindowModality(Qt.WindowModal)
-            self.progress_dialog.setCancelButton(None)
-            self.progress_dialog.show()
-            
-            # 修改这里：使用code目录下的data文件夹
-            data_dir = os.path.join(os.path.dirname(__file__), 'data')
-            os.makedirs(data_dir, exist_ok=True)
-            
-            # 获取更新线程
-            update_thread = get_and_save_stock_list(data_dir)
-            
-            # 连接信号
-            update_thread.progress.connect(self.show_update_progress)
-            update_thread.finished.connect(self.handle_update_finished)
-            
-            # 保存线程引用
-            self.update_thread = update_thread
-            
-        except Exception as e:
-            # 恢复按钮
-            if update_stock_list_btn:
-                update_stock_list_btn.setEnabled(True)
-            self.progress_dialog.close()
-            logging.error(f"更新股票列表时出错: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"更新股票列表时出错: {str(e)}")
-
-    def show_update_progress(self, message):
-        """显示更新进度"""
-        if hasattr(self, 'progress_dialog'):
-            self.progress_dialog.setLabelText(message)
-
-    def handle_update_finished(self, success, message):
-        """处理更新完成"""
-        if hasattr(self, 'progress_dialog'):
-            self.progress_dialog.close()
-        
-        if success:
-            QMessageBox.information(self, "成功", "股票列表更新成功！")
-        else:
-            QMessageBox.warning(self, "失败", f"更新股票列表失败：{message}")
-        
-        # 清理线程
-        if hasattr(self, 'update_thread'):
-            self.update_thread = None
-
 class CleanerThread(QThread):
     progress_updated = pyqtSignal(int, int)
     cleaning_completed = pyqtSignal(dict)
@@ -811,6 +812,7 @@ class CleanerThread(QThread):
             
         except Exception as e:
             self.error_occurred.emit(str(e))
+
 class StockDataProcessorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -821,24 +823,23 @@ class StockDataProcessorGUI(QMainWindow):
         logging.info(f"QSettings格式: {settings.format()}")
         logging.info(f"QSettings范围: {settings.scope()}")
         
+        # 检测屏幕分辨率并设置字体大小比例
+        self.font_scale = self.detect_screen_resolution()
+        
         # 移除激活相关的初始化代码
         self._activation_warning_shown = False
 
-        # 修改图标路径的获取方式
-        if getattr(sys, 'frozen', False):
-            # 打包后的环境，图标文件在 _internal/icons 目录下
-            self.ICON_PATH = os.path.join(os.path.dirname(sys.executable), '_internal', 'icons')
-        else:
-            # 开发环境
-            self.ICON_PATH = os.path.join(os.path.dirname(__file__), 'icons')
+        # 源码模式的图标路径
+        self.ICON_PATH = os.path.join(os.path.dirname(__file__), 'icons')
         
         # 确保图标目录存在
         os.makedirs(self.ICON_PATH, exist_ok=True)
 
         # 添加调试日志
-        logging.info(f"初始化图标路径: {self.ICON_PATH}")
+        # logging.info(f"初始化图标路径: {self.ICON_PATH}")
         if os.path.exists(self.ICON_PATH):
-            logging.info(f"图标目录内容: {os.listdir(self.ICON_PATH)}")
+            pass
+            #logging.info(f"图标目录内容: {os.listdir(self.ICON_PATH)}")
         else:
             logging.warning(f"图标目录不存在: {self.ICON_PATH}")
 
@@ -849,12 +850,15 @@ class StockDataProcessorGUI(QMainWindow):
         self.initialize_update_manager()
 
         # 修改窗口属性设置
-        self.setAttribute(Qt.WA_TranslucentBackground, False)  # 禁用透明背景
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint)  # 添加系统菜单支持
+        # self.setAttribute(Qt.WA_TranslucentBackground) # 移除
+        # self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint) # 移除，使用默认窗口样式
         
-        # 设置窗口背景色
+        # 移除之前设置的非透明背景（冲突设置）
+        # self.setAttribute(Qt.WA_TranslucentBackground, False)  # 禁用透明背景
+
+        # 设置窗口背景色 (这个会影响 central_widget 的背景，如果central_widget有自己的背景设置，这个可能不需要)
         palette = self.palette()
-        palette.setColor(QPalette.Window, QColor("#1E1E1E"))
+        palette.setColor(QPalette.Window, QColor("#2b2b2b"))
         self.setPalette(palette)
 
         # 获取版本信息
@@ -865,11 +869,12 @@ class StockDataProcessorGUI(QMainWindow):
             self.version_label.setText(f"V{self.version_info['version']}")
 
         self.initUI()
-        self.can_drag = False
-        self.resizing = False
-        self.resize_edge = None
-        self.border_thickness = 20
-        self.setMouseTracking(True)
+        # 下面这些属性是为无边框窗口拖动和缩放服务的，现在移除
+        # self.can_drag = False
+        # self.resizing = False
+        # self.resize_edge = None
+        # self.border_thickness = 20 
+        # self.setMouseTracking(True) # 如果没有其他地方用到mouseMoveEvent，则此行也应移除
         
         # 添加定时器来检查软件状态
         self.status_timer = QTimer(self)
@@ -884,8 +889,473 @@ class StockDataProcessorGUI(QMainWindow):
         self.refresh_timer.setSingleShot(True)
         self.refresh_timer.timeout.connect(self.refresh_folder)
 
-        # 创建状态栏
-        self.statusBar().showMessage('就绪')
+        # 不再使用状态栏，改用status_label (status_label现在也没有明确位置了)
+        # self.statusBar().showMessage('就绪')
+        
+        # 隐藏状态栏 (如果用系统标题栏，可以考虑显示状态栏)
+        # self.statusBar().hide()
+
+        # 获取屏幕分辨率
+        screen = QApplication.primaryScreen().geometry()
+        screen_width = screen.width()
+        screen_height = screen.height()
+        
+        # 设置初始窗口大小（将通过showFullScreen()进入全屏）
+        # 在全屏模式下不需要初始resize，因为会立即进入全屏
+
+    def detect_screen_resolution(self):
+        """检测屏幕分辨率并返回字体缩放比例"""
+        from PyQt5.QtWidgets import QApplication
+        screen = QApplication.desktop().screenGeometry()
+        width = screen.width()
+        height = screen.height()
+        
+        # 根据屏幕宽度确定字体缩放比例
+        if width >= 2560:  # 4K及以上分辨率
+            return 1.4
+        elif width >= 1920:  # 1080p及以上分辨率  
+            return 1.2
+        elif width >= 1440:  # 720p及以上分辨率
+            return 1.0
+        else:  # 低分辨率
+            return 0.9
+
+    def get_scaled_stylesheet(self):
+        """获取根据分辨率缩放的样式表"""
+        # 基础字体大小
+        base_sizes = {
+            'small': 12,
+            'normal': 14, 
+            'large': 16,
+            'xl': 18,
+            'xxl': 24,
+            'xxxl': 30
+        }
+        
+        # 计算缩放后的字体大小
+        scaled_sizes = {k: int(v * self.font_scale) for k, v in base_sizes.items()}
+        
+        return f"""
+            /* 主窗口和基础样式 */
+            QMainWindow {{
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            QWidget#mainContainer {{
+                background-color: #2b2b2b;
+                color: #f0f0f0;
+                border: none;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            QWidget {{
+                background-color: #2b2b2b;
+                color: #f0f0f0;
+                border: none;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            /* 分组框样式 */
+            QGroupBox {{
+                background-color: #333333;
+                border: 1px solid #4a4a4a;
+                border-radius: 6px;
+                margin-top: 1em;
+                padding-top: 1em;
+                color: #f0f0f0;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #f0f0f0;
+                font-weight: bold;
+                background-color: #333333;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            /* 标签样式 */
+            QLabel {{
+                color: #f0f0f0;
+                background-color: transparent;
+                border: none;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            /* 链接样式 */
+            QLabel[linkEnabled="true"] {{
+                color: #b0b0b0;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QLabel[linkEnabled="true"]:hover {{
+                color: #ffffff;
+            }}
+            
+            /* 输入框样式 */
+            QLineEdit {{
+                background-color: #3a3a3a;
+                border: 1px solid #454545;
+                border-radius: 4px;
+                padding: 5px;
+                color: #f0f0f0;
+                selection-background-color: #0078d7;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid #0078d7;
+                background-color: #3c3c3c;
+            }}
+            
+            /* 按钮样式 */
+            QPushButton {{
+                background-color: #444444;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 6px 14px;
+                color: #f0f0f0;
+                min-width: 80px;
+                font-weight: bold;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QPushButton:hover {{
+                background-color: #505050;
+                border-color: #555555;
+            }}
+            QPushButton:pressed {{
+                background-color: #353535;
+                border-color: #0078d7;
+            }}
+            QPushButton:disabled {{
+                background-color: #353535;
+                color: #777777;
+                border-color: #3c3c3c;
+            }}
+
+            /* 工具栏按钮特殊样式 */
+            QPushButton#toolbarButton {{
+                background-color: transparent;
+                border: none;
+                padding: 5px;
+                min-width: 0px;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QPushButton#toolbarButton:hover {{
+                background-color: #505050;
+            }}
+            QPushButton#toolbarButton:pressed {{
+                background-color: #353535;
+            }}
+            
+            /* 下拉框样式 */
+            QComboBox {{
+                background-color: #3a3a3a;
+                border: 1px solid #454545;
+                border-radius: 4px;
+                padding: 5px;
+                color: #f0f0f0;
+                min-width: 100px;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid #555555;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox::down-arrow {{
+                image: none; 
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #f0f0f0;
+                margin-right: 5px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: #3a3a3a;
+                border: 1px solid #454545;
+                selection-background-color: #0078d7;
+                selection-color: #ffffff;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            /* 表格样式 */
+            QTableWidget {{
+                background-color: #333333;
+                alternate-background-color: #383838;
+                border: 1px solid #3c3c3c;
+                color: #f0f0f0;
+                gridline-color: #3c3c3c;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QTableWidget::item {{
+                padding: 5px;
+                background-color: transparent;
+                border: none;
+            }}
+            QTableWidget::item:selected {{
+                background-color: #0078d7;
+                color: #ffffff;
+            }}
+            QHeaderView::section {{
+                background-color: #3a3a3a;
+                color: #f0f0f0;
+                padding: 8px;
+                border: none;
+                border-right: 1px solid #454545;
+                border-bottom: 1px solid #454545;
+                font-weight: bold;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QTableCornerButton::section {{
+                background-color: #3a3a3a;
+                border: none;
+                border-right: 1px solid #454545;
+                border-bottom: 1px solid #454545;
+            }}
+            QTableCornerButton::section:pressed {{
+                background-color: #444444;
+            }}
+            
+            /* 复选框样式 */
+            QCheckBox {{
+                color: #f0f0f0;
+                spacing: 5px;
+                background-color: transparent;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 2px solid #555555;
+                border-radius: 3px;
+                background-color: #3a3a3a;
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: #0078d7;
+                border: 2px solid #0078d7;
+            }}
+            QCheckBox::indicator:hover {{
+                border: 2px solid #777777;
+            }}
+            
+            /* 单选按钮样式 */
+            QRadioButton {{
+                color: #f0f0f0;
+                spacing: 5px;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QRadioButton::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 2px solid #555555;
+                border-radius: 8px;
+                background-color: #3a3a3a;
+            }}
+            QRadioButton::indicator:checked {{
+                background-color: #0078d7;
+                border: 2px solid #0078d7;
+            }}
+            QRadioButton::indicator:hover {{
+                border: 2px solid #777777;
+            }}
+            
+            /* 旋转框样式 */
+            QSpinBox, QDoubleSpinBox {{
+                background-color: #3a3a3a;
+                border: 1px solid #454545;
+                border-radius: 4px;
+                padding: 5px;
+                color: #f0f0f0;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QSpinBox:focus, QDoubleSpinBox:focus {{
+                border: 1px solid #0078d7;
+                background-color: #3c3c3c;
+            }}
+            
+            /* 日期时间编辑器样式 */
+            QDateEdit, QTimeEdit, QDateTimeEdit {{
+                background-color: #3a3a3a;
+                border: 1px solid #454545;
+                border-radius: 4px;
+                padding: 5px;
+                color: #f0f0f0;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QDateEdit:focus, QTimeEdit:focus, QDateTimeEdit:focus {{
+                border: 1px solid #0078d7;
+                background-color: #3c3c3c;
+            }}
+            
+            /* 文本编辑器样式 */
+            QTextEdit, QPlainTextEdit {{
+                background-color: #333333;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                color: #f0f0f0;
+                selection-background-color: #0078d7;
+                font-family: "Consolas", "Microsoft YaHei", monospace;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            /* 进度条样式 */
+            QProgressBar {{
+                background-color: #3a3a3a;
+                border: 1px solid #454545;
+                border-radius: 5px;
+                text-align: center;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QProgressBar::chunk {{
+                background-color: #0078d7;
+                border-radius: 4px;
+            }}
+            
+            /* 状态栏样式 */
+            QStatusBar {{
+                background-color: #333333;
+                color: #f0f0f0;
+                border-top: 1px solid #454545;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            
+            /* 菜单栏样式 */
+            QMenuBar {{
+                background-color: #333333;
+                color: #f0f0f0;
+                border-bottom: 1px solid #454545;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QMenuBar::item {{
+                background-color: transparent;
+                padding: 4px 8px;
+            }}
+            QMenuBar::item:selected {{
+                background-color: #505050;
+            }}
+            
+            /* 菜单样式 */
+            QMenu {{
+                background-color: #333333;
+                border: 1px solid #454545;
+                color: #f0f0f0;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QMenu::item {{
+                padding: 6px 20px;
+                background-color: transparent;
+            }}
+            QMenu::item:selected {{
+                background-color: #505050;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background-color: #454545;
+                margin: 2px 0px;
+            }}
+            
+            /* 工具栏样式 */
+            QToolBar {{
+                background-color: #333333;
+                border: none;
+                spacing: 2px;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QToolBar::separator {{
+                background-color: #454545;
+                width: 1px;
+                margin: 2px;
+            }}
+            
+            /* 工具提示样式 */
+            QToolTip {{
+                background-color: #555555;
+                color: #f0f0f0;
+                border: 1px solid #666666;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: {scaled_sizes['small']}px;
+            }}
+            
+            /* Tab样式 */
+            QTabWidget::pane {{
+                border: 1px solid #454545;
+                background-color: #333333;
+            }}
+            QTabBar::tab {{
+                background-color: #3a3a3a;
+                color: #f0f0f0;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                font-size: {scaled_sizes['normal']}px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: #333333;
+                border-bottom: 2px solid #0078d7;
+            }}
+            QTabBar::tab:hover {{
+                background-color: #505050;
+            }}
+            
+            /* 分割器样式 */
+            QSplitter::handle {{
+                background-color: #454545;
+            }}
+            QSplitter::handle:horizontal {{
+                width: 2px;
+            }}
+            QSplitter::handle:vertical {{
+                height: 2px;
+            }}
+            
+            /* 滚动条样式 */
+            QScrollBar:vertical {{
+                background-color: #2b2b2b; 
+                width: 12px;
+                margin: 0px;
+                border: none;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: #4d4d4d;
+                min-height: 20px;
+                border-radius: 6px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: #5a5a5a;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: none;
+            }}
+            QScrollBar:horizontal {{
+                background-color: #2b2b2b;
+                height: 12px;
+                margin: 0px;
+                border: none;
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: #4d4d4d;
+                min-width: 20px;
+                border-radius: 6px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background-color: #5a5a5a;
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
+            }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+                background: none;
+            }}
+        """
 
     def load_icon(self, icon_name):
         """统一的图标加载方法"""
@@ -952,9 +1422,10 @@ class StockDataProcessorGUI(QMainWindow):
     def update_status_indicator(self, color, tooltip, connection_status=None):
         """
         更新状态指示器的颜色和提示信息
+        (状态指示器 QLabel 控件已移除，此方法可能需要修改或移除，除非有新的状态显示机制)
         """
         try:
-            if hasattr(self, 'status_indicator'):
+            if hasattr(self, 'status_indicator'): # status_indicator QLabel 已被注释掉
                 # 获取当前MiniQMT状态
                 miniQMT_status = "MiniQMT已启动" if self.is_software_running("XtMiniQmt.exe") else "MiniQMT未启动"
                 
@@ -1012,8 +1483,6 @@ class StockDataProcessorGUI(QMainWindow):
             
         QApplication.quit()
 
-
-
     def check_activation_status(self):
         """检查软件激活状态"""
         return self.activation_manager.is_activated()
@@ -1042,36 +1511,29 @@ class StockDataProcessorGUI(QMainWindow):
 
     def initialize_update_manager(self):
         """初始化更新管理器"""
-        self.update_manager = UpdateManager(self)
-        self.update_manager.check_finished.connect(self.handle_update_check_finished)
-        
-        # 加载更新设置
-        self.set_update_config()
-        
+        # 禁用更新管理器
+        self.update_manager = None
+        pass
+    
     def set_update_config(self):
         """设置更新配置"""
-        settings = QSettings('KHQuant', 'StockAnalyzer')
-        self.update_manager.auto_check = settings.value('auto_check_update', True, type=bool)
-        self.update_manager.update_channel = settings.value('update_channel', 'stable', type=str)
-
+        # 禁用更新配置
+        pass
+    
     def check_for_updates(self):
-        try:
-            logging.info("开始检查软件更新")
-            # 确保发送当前版本号
-            current_version = get_version_info()['version']
-            # 调用更新检查，只传递版本号
-            self.update_manager.check_for_updates(current_version)
-        except Exception as e:
-            logging.error(f"检查更新时发生错误: {str(e)}", exc_info=True)
-            QMessageBox.warning(self, "更新检查失败", f"检查更新时发生错误: {str(e)}")
-
+        """检查软件更新"""
+        # 禁用更新检查
+        pass
+    
+    def delayed_update_check(self):
+        """延迟执行更新检查"""
+        # 禁用延迟更新检查
+        pass
+    
     def handle_update_check_finished(self, success, message):
         """处理更新检查完成的回调"""
-        logging.info(f"更新检查完成: 成功={success}, 消息={message}")
-        # if success and not message.startswith("当前已是最新版本"):
-        #     QMessageBox.warning(self, "更新检查", message)
-
-
+        # 禁用更新检查回调
+        pass
 
     def show_version_menu(self):
         """显示版本相关的菜单"""
@@ -1113,6 +1575,7 @@ class StockDataProcessorGUI(QMainWindow):
         # 根据屏幕分辨率动态设置图标大小
         screen = QApplication.primaryScreen().geometry()
         screen_width = screen.width()
+        screen_height = screen.height()
                 
         # 根据屏幕宽度设置不同的图标大小
         if screen_width >= 2560:  # 2K及以上分辨率
@@ -1140,7 +1603,7 @@ class StockDataProcessorGUI(QMainWindow):
     def disable_all_controls(self):
         """禁用所有控件"""
         for widget in self.findChildren(QPushButton):
-            if widget.objectName() not in ["minButton", "maxButton", "closeButton", "helpButton"]:
+            if widget.objectName() not in ["minButton", "maxButton", "closeButton", "helpButton"]: # 这些按钮已移除
                 widget.setEnabled(False)
         
         for widget in self.findChildren(QLineEdit):
@@ -1190,6 +1653,7 @@ class StockDataProcessorGUI(QMainWindow):
         if current_path and os.path.exists(current_path):
             self.load_folder_info(current_path)
             logging.info(f"已刷新文件夹内容: {current_path}")
+            
     def browse_folder(self):
         """浏览文件夹并更新显示"""
         folder_path = QFileDialog.getExistingDirectory(self, "选择数据文件夹")
@@ -1200,39 +1664,53 @@ class StockDataProcessorGUI(QMainWindow):
             if hasattr(self, 'local_data_path_edit'):
                 self.local_data_path_edit.setText(folder_path)
 
-
     def initUI(self):
-        self.setWindowTitle('看海量化交易系统')
+        # 设置窗口标题栏颜色（仅适用于Windows） - 借鉴 GUIkhQuant.py
+        if sys.platform == 'win32':
+            try:
+                from ctypes import windll, c_int, byref, sizeof
+                from ctypes.wintypes import DWORD
+
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                DWMWA_CAPTION_COLOR = 35
+                
+                hwnd = int(self.winId())
+                # 启用深色模式
+                windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    byref(c_int(2)),  # 2 means true
+                    sizeof(c_int)
+                )
+                
+                # 设置标题栏颜色
+                caption_color = DWORD(0x2b2b2b)  # 使用与主界面相同的颜色
+                windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_COLOR,
+                    byref(caption_color),
+                    sizeof(caption_color)
+                )
+
+            except Exception as e:
+                logging.warning(f"设置Windows标题栏深色模式或颜色失败: {str(e)}")
+
+        self.setWindowTitle('CSV数据管理模块')
         
-        # 设置最小尺寸
-        MIN_SIZE = 1000
+        # 设置最小尺寸（减小窗口尺寸）
+        MIN_SIZE = 800  # 将最小尺寸从900减小到800
         self.setMinimumSize(MIN_SIZE, MIN_SIZE)
         
-        # 获取屏幕分辨率
-        screen = QApplication.primaryScreen().geometry()
-        screen_width = screen.width()
-        screen_height = screen.height()
+        # 获取屏幕分辨率以用于居中
+        screen_geometry = QApplication.primaryScreen().geometry()
         
-        # 计算窗口大小：
-        # 1. 首先尝试使用屏幕大小的75%
-        # 2. 如果计算出的大小小于最小尺寸，则使用最小尺寸
-        # 3. 如果计算出的大小大于屏幕大小的90%，则使用90%
-        window_width = int(screen_width * 0.75)
-        window_height = int(screen_height * 0.75)
-        
-        # 确保窗口大小不小于最小尺寸
-        window_width = max(window_width, MIN_SIZE)
-        window_height = max(window_height, MIN_SIZE)
-        
-        # 确保窗口大小不超过屏幕90%
-        max_width = int(screen_width * 0.9)
-        max_height = int(screen_height * 0.9)
-        window_width = min(window_width, max_width)
-        window_height = min(window_height, max_height)
+        # 设置默认窗口大小为 1000x1000
+        window_width = 1300
+        window_height = 1300
         
         # 计算居中位置
-        x_position = (screen_width - window_width) // 2
-        y_position = (screen_height - window_height) // 2
+        x_position = (screen_geometry.width() - window_width) // 2
+        y_position = (screen_geometry.height() - window_height) // 2
         
         # 设置窗口几何尺寸（位置和大小）
         self.setGeometry(x_position, y_position, window_width, window_height)
@@ -1294,69 +1772,58 @@ class StockDataProcessorGUI(QMainWindow):
             
         print("=== 调试信息结束 ===\n")
 
-
-        
-
-        # 确保窗口没有额外的边框
-        self.setWindowFlag(Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # self.setWindowFlag(Qt.FramelessWindowHint) # 移除
+        # self.setAttribute(Qt.WA_TranslucentBackground) # 移除
         
         central_widget = QWidget()
+        central_widget.setObjectName("mainContainer") # mainContainer 样式可能需要调整
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(10, 10, 10, 10) # 边距可以保留
 
-        # 添加自定义标题栏
-        title_bar = QWidget()
-        title_bar.setObjectName("titleBar")
-        title_bar.setFixedHeight(60)
-        title_bar_layout = QHBoxLayout(title_bar)
-        title_bar_layout.setContentsMargins(10, 0, 10, 0)
-        
-        title_bar_layout.addStretch()
-        title_label = QLabel("看海量化交易系统")
-        title_label.setStyleSheet("color: #E0E0E0; font-weight: bold; font-size: 30px; ")
-        title_bar_layout.addWidget(title_label, alignment=Qt.AlignCenter)
-        title_bar_layout.addStretch()
+        # --- 自定义标题栏移除开始 ---
+        # title_bar = QWidget()
+        # title_bar.setObjectName("titleBar")
+        # title_bar.setFixedHeight(40)
+        # title_bar_layout = QHBoxLayout(title_bar)
+        # title_bar_layout.setContentsMargins(15, 0, 10, 0) 
+        # title_bar_layout.setSpacing(0) 
+        # title_label = QLabel("看海量化交易系统——数据模块")
+        # title_label.setObjectName("titleLabel")
+        # title_bar_layout.addWidget(title_label)
+        # title_bar_layout.addStretch()
+        # help_button = QPushButton("?")
+        # help_button.setObjectName("helpButton")
+        # help_button.setFixedSize(40, 40)
+        # help_button.clicked.connect(self.show_help) 
+        # title_bar_layout.addWidget(help_button)
+        # for button_text, func, obj_name in [("—", self.showMinimized, "minButton"), 
+        #                                     ("□", self.toggle_maximize, "maxButton"), 
+        #                                     ("×", self.close, "closeButton")]:
+        #     button = QPushButton(button_text)
+        #     button.setObjectName(obj_name)
+        #     button.setFixedSize(40, 40)
+        #     button.clicked.connect(func)
+        #     title_bar_layout.addWidget(button)
+        # main_layout.addWidget(title_bar)
+        # --- 自定义标题栏移除结束 ---
 
-        # 添加帮助按钮
-        help_button = QPushButton("?")
-        help_button.setObjectName("helpButton")
-        help_button.setFixedSize(40, 40)
-        help_button.clicked.connect(self.show_help)
-        title_bar_layout.addWidget(help_button)
-
-        # 添加最小化、最大化和关闭按钮
-        for button_text, func, obj_name in [("—", self.showMinimized, "minButton"), 
-                                            ("□", self.toggle_maximize, "maxButton"), 
-                                            ("×", self.close, "closeButton")]:
-            button = QPushButton(button_text)
-            button.setObjectName(obj_name)
-            button.setFixedSize(40, 40)
-            button.clicked.connect(func)
-            title_bar_layout.addWidget(button)
-
-        main_layout.addWidget(title_bar)
-
-        # 在标题栏中添加状态指示器
-        self.status_indicator = QLabel()
-        self.status_indicator.setFixedSize(20, 20)
-        self.status_indicator.setToolTip("交易平台状态")
-        title_bar_layout.insertWidget(title_bar_layout.count() - 3, self.status_indicator)
-        
-
-
+        # 状态指示器需要重新考虑位置，原自定义标题栏已移除
+        # self.status_indicator = QLabel()
+        # self.status_indicator.setFixedSize(20, 20)
+        # self.status_indicator.setToolTip("交易平台状态")
+        # title_bar_layout.insertWidget(title_bar_layout.count() - 3, self.status_indicator) # 会报错
 
         # 添加数据可视化按钮到工具栏
         visualize_btn = QPushButton()
         visualize_btn.setIcon(self.load_icon('visualize.png'))
 
-
         # 根据屏幕分辨率动态设置图标大小
         screen = QApplication.primaryScreen().geometry()
         screen_width = screen.width()
+        screen_height = screen.height()
                 
-        # 根据屏幕宽度设置不同的图标大小
+        # 根据屏幕宽度设置不同的图标大小（与 add_version_menu 和 GUIkhQuant.py 统一）
         if screen_width >= 2560:  # 2K及以上分辨率
             icon_size = 60
         elif screen_width >= 1920:  # 1080P
@@ -1364,43 +1831,45 @@ class StockDataProcessorGUI(QMainWindow):
         else:  # 较低分辨率
             icon_size = 32
         
-        '''
         # 添加图标加载错误处理
-        if os.path.exists(icon_path):
-            visualize_btn.setIcon(QIcon(icon_path))
-        else:
-            logging.warning(f"图标文件未找到: {icon_path}")
-            # 创建一个临时的替代图标
-            self.create_fallback_icon()
-            visualize_btn.setIcon(QIcon(os.path.join(self.ICON_PATH, 'visualize.png')))
-        '''
+        # if os.path.exists(icon_path): # icon_path 在这里未定义，应该用 self.ICON_PATH
+        #    visualize_btn.setIcon(QIcon(icon_path))
+        # else:
+        #    logging.warning(f"图标文件未找到: {icon_path}")
+        #    # 创建一个临时的替代图标
+        #    self.create_fallback_icon()
+        #    visualize_btn.setIcon(QIcon(os.path.join(self.ICON_PATH, 'visualize.png')))
+        # 使用 self.load_icon 来加载，它内部处理了回退
+        visualize_btn.setIcon(self.load_icon('visualize.png'))
         
                 
         # 根据屏幕分辨率动态设置工具栏高度
         if screen_width >= 2560 or screen_height >= 1440:  # 2K及以上分辨率
             toolbar_height = 70
-            toolbar_margins = (20, 10, 20, 10)
+            toolbar_margins_left_right = 20
             toolbar_spacing = 20
         elif screen_width >= 1920 or screen_height >= 1080:  # 1080P
             toolbar_height = 60
-            toolbar_margins = (15, 8, 15, 8)
+            toolbar_margins_left_right = 15
             toolbar_spacing = 15
         else:  # 较低分辨率
-            toolbar_height = 45
-            toolbar_margins = (10, 5, 10, 5)
+            toolbar_height = 50 # GUIkhQuant.py中较低分辨率工具栏高度通常为50
+            toolbar_margins_left_right = 10
             toolbar_spacing = 10
+            
         toolbar_widget = QWidget()
-        toolbar_widget.setObjectName("toolbarWidget")
+        toolbar_widget.setObjectName("toolbarWidget") # 确保ID用于样式表
         toolbar_widget.setFixedHeight(toolbar_height)
         toolbar_layout = QHBoxLayout(toolbar_widget)
+        toolbar_layout.setObjectName("toolbarLayout") # 添加ID
         # 修改上下边距为0，保持左右边距不变
-        toolbar_layout.setContentsMargins(toolbar_margins[0], 0, toolbar_margins[2], 0)
+        toolbar_layout.setContentsMargins(toolbar_margins_left_right, 0, toolbar_margins_left_right, 0)
         toolbar_layout.setSpacing(toolbar_spacing)
         # 设置布局的对齐方式为垂直居中
-        toolbar_layout.setAlignment(Qt.AlignVCenter)
+        toolbar_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft) # 明确左对齐
         
         visualize_btn.setIconSize(QtCore.QSize(icon_size, icon_size))
-        visualize_btn.setFixedSize(icon_size + 6, icon_size + 6)
+        visualize_btn.setFixedSize(icon_size + 8, icon_size + 8) # 稍微调整按钮大小以适应图标
         visualize_btn.setToolTip('数据可视化')
         visualize_btn.clicked.connect(self.open_visualization)
         visualize_btn.setObjectName("toolbarButton")
@@ -1410,7 +1879,7 @@ class StockDataProcessorGUI(QMainWindow):
         settings_btn = QPushButton()
         settings_btn.setIcon(self.load_icon('settings.png'))
         settings_btn.setIconSize(QtCore.QSize(icon_size, icon_size))
-        settings_btn.setFixedSize(icon_size + 6, icon_size + 6)
+        settings_btn.setFixedSize(icon_size + 8, icon_size + 8) # 稍微调整按钮大小
         settings_btn.setToolTip('设置')
         settings_btn.clicked.connect(self.show_settings)
         settings_btn.setObjectName("toolbarButton") 
@@ -1426,8 +1895,10 @@ class StockDataProcessorGUI(QMainWindow):
         toolbar_layout.addStretch()
         
         main_layout.addWidget(toolbar_widget)
-        # 创建水平布局来容纳两个界面
-        h_layout = QHBoxLayout()
+        
+        # 创建水平分割器来容纳两个界面，确保固定比例
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)  # 防止面板被完全折叠
 
         # 添加左侧下载界面
         left_scroll = QScrollArea()
@@ -1438,7 +1909,7 @@ class StockDataProcessorGUI(QMainWindow):
         
         # 添加下载界面的组件
         self.add_downloader_interface(left_layout)
-        h_layout.addWidget(left_scroll)
+        splitter.addWidget(left_scroll)
 
         # 添加右侧清洗界面
         right_scroll = QScrollArea()
@@ -1449,10 +1920,15 @@ class StockDataProcessorGUI(QMainWindow):
         
         # 添加清洗界面的组件
         self.add_cleaner_interface(right_layout)
-        h_layout.addWidget(right_scroll)
+        splitter.addWidget(right_scroll)
 
-        # 将水平布局添加到主布局
-        main_layout.addLayout(h_layout)
+        # 设置初始分割比例（左:右 = 1:1）
+        splitter.setSizes([500, 500])
+        splitter.setStretchFactor(0, 1)  # 左侧面板拉伸因子
+        splitter.setStretchFactor(1, 1)  # 右侧面板拉伸因子
+
+        # 将分割器添加到主布局
+        main_layout.addWidget(splitter)
 
         if not os.path.exists(icon_path):
             # 如果图标不存在，创建一个简单的默认图标
@@ -1491,112 +1967,8 @@ class StockDataProcessorGUI(QMainWindow):
             logging.error(f"创建备用图标时出错: {str(e)}", exc_info=True)
             return QIcon()  # 返回空图标作为最后的回退方案
 
-    def toggle_maximize(self):
-        if self.isMaximized():
-            self.showNormal()
-            # 改变按钮文本为最大化图标
-            for button in self.findChildren(QPushButton):
-                if button.objectName() == "maxButton":
-                    button.setText("□")
-        else:
-            self.showMaximized()
-            # 改变按钮文本为恢复图标
-            for button in self.findChildren(QPushButton):
-                if button.objectName() == "maxButton":
-                    button.setText("❐")  # 使用不同的Unicode字符表示恢复图标
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            # 检查鼠标是否在标题栏内
-            title_bar = self.findChild(QWidget, "titleBar")
-            if title_bar and event.pos().y() <= title_bar.height():
-                self.can_drag = True
-                self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
-            else:
-                # 检查是否在窗口边缘
-                edge = self.get_resize_edge(event.pos())
-                if edge:
-                    self.resizing = True
-                    self.resize_edge = edge
-            event.accept()
-            
-    def paintEvent(self, event):
-        # 添加自定义绘制以确保窗口边框正确显示
-        painter = QPainter(self)
-        painter.setPen(QColor("#3D3D3D"))
-        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
-        super().paintEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton:
-            if self.can_drag:
-                self.move(event.globalPos() - self.drag_position)
-            elif self.resizing:
-                self.resize_window(event.globalPos())
-        else:
-            cursor_changed = False
-            if event.pos().x() <= self.border_thickness:
-                QApplication.setOverrideCursor(Qt.SizeHorCursor)
-                cursor_changed = True
-            elif event.pos().x() >= self.width() - self.border_thickness:
-                QApplication.setOverrideCursor(Qt.SizeHorCursor)
-                cursor_changed = True
-            elif event.pos().y() <= self.border_thickness:
-                QApplication.setOverrideCursor(Qt.SizeVerCursor)
-                cursor_changed = True
-            elif event.pos().y() >= self.height() - self.border_thickness:
-                QApplication.setOverrideCursor(Qt.SizeVerCursor)
-                cursor_changed = True
-            
-            if not cursor_changed:
-                QApplication.restoreOverrideCursor()
-        
-        event.accept()
-
-    def leaveEvent(self, event):
-        QApplication.restoreOverrideCursor()
-        event.accept()
-
-    def mouseReleaseEvent(self, event):
-        self.can_drag = False
-        self.resizing = False
-        self.resize_edge = None
-        self.setCursor(Qt.ArrowCursor)
-        event.accept()
-
-    def get_resize_edge(self, pos):
-        rect = self.rect()
-        if pos.x() <= self.border_thickness:
-            if pos.y() <= self.border_thickness:
-                return 'topleft'
-            elif pos.y() >= rect.height() - self.border_thickness:
-                return 'bottomleft'
-            else:
-                return 'left'
-        elif pos.x() >= rect.width() - self.border_thickness:
-            if pos.y() <= self.border_thickness:
-                return 'topright'
-            elif pos.y() >= rect.height() - self.border_thickness:
-                return 'bottomright'
-            else:
-                return 'right'
-        elif pos.y() <= self.border_thickness:
-            return 'top'
-        elif pos.y() >= rect.height() - self.border_thickness:
-            return 'bottom'
-        return None
-
-    def resize_window(self, global_pos):
-        new_geo = self.geometry()
-        if self.resize_edge in ['left', 'topleft', 'bottomleft']:
-            new_geo.setLeft(global_pos.x())
-        if self.resize_edge in ['right', 'topright', 'bottomright']:
-            new_geo.setRight(global_pos.x())
-        if self.resize_edge in ['top', 'topleft', 'topright']:
-            new_geo.setTop(global_pos.y())
-        if self.resize_edge in ['bottom', 'bottomleft', 'bottomright']:
-            new_geo.setBottom(global_pos.y())
-        self.setGeometry(new_geo)
+    # paintEvent, mouseMoveEvent, mousePressEvent, mouseReleaseEvent, leaveEvent, 
+    # get_resize_edge, resize_window, toggle_maximize 方法将被完全删除。
 
     def create_colored_pixmap(self, color, size=20):
         pixmap = QPixmap(size, size)
@@ -1654,8 +2026,8 @@ class StockDataProcessorGUI(QMainWindow):
         
         # 添加标题
         title_label = QLabel("数据下载")
-        title_label.setFont(QFont("Roboto", 14, QFont.Bold))
-        title_label.setStyleSheet("color: #E0E0E0;")
+        # title_label.setFont(QFont("Roboto", 12, QFont.Bold))  # 由样式表或默认字体控制
+        title_label.setStyleSheet("color: #E0E0E0; margin-bottom: 10px;") 
         layout.addWidget(title_label)
 
         self.add_path_group(layout, title_font)
@@ -1666,14 +2038,28 @@ class StockDataProcessorGUI(QMainWindow):
         self.add_time_group(layout, title_font)
         self.add_download_section(layout)
 
+        # 创建状态标签容器来控制宽度
+        status_container = QWidget()
+        status_container.setMaximumWidth(500)  # 设置最大宽度
+        status_container.setMinimumWidth(200)  # 设置最小宽度
+        status_layout = QVBoxLayout(status_container)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        
         self.status_label = QLabel()
-        self.status_label.setStyleSheet("color: #E0E0E0; font-size: 24px;")
-        layout.addWidget(self.status_label)
+        self.status_label.setStyleSheet("color: #E0E0E0; font-size: 14px; line-height: 1.2;")
+        self.status_label.setWordWrap(True)  # 启用文本换行
+        # 设置固定高度，大约能显示两行文字（14px字体 * 1.2行高 * 2行 + 一些padding）
+        self.status_label.setFixedHeight(40)  
+        self.status_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)  # 设置对齐方式
+        status_layout.addWidget(self.status_label)
+        
+        layout.addWidget(status_container)
+
     def add_cleaner_interface(self, layout):
         # 添加标题
         title_label = QLabel("数据清洗")
-        title_label.setFont(QFont("Roboto", 14, QFont.Bold))
-        title_label.setStyleSheet("color: #E0E0E0;")
+        # title_label.setFont(QFont("Roboto", 12, QFont.Bold))  # 由样式表或默认字体控制
+        title_label.setStyleSheet("color: #E0E0E0; margin-bottom: 10px;")
         layout.addWidget(title_label)
 
         # 文件夹选择组
@@ -1726,6 +2112,7 @@ class StockDataProcessorGUI(QMainWindow):
         preview_group = QGroupBox("清洗结果预览")
         preview_group.setObjectName("预览组")
         preview_layout = QVBoxLayout()
+        preview_layout.setContentsMargins(8, 8, 8, 8)  # 减少内边距
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
         preview_layout.addWidget(self.preview_text)
@@ -1840,11 +2227,14 @@ class StockDataProcessorGUI(QMainWindow):
             logging.info("已刷新文件夹内容")
 
     def add_stock_group(self, layout, title_font):
-        stock_group = QGroupBox("股票代码列表文件")
-        stock_group.setFont(title_font)
-        stock_layout = QVBoxLayout()
+        # 创建股票代码列表组
+        stocks_group = QGroupBox("股票代码列表文件")
+        stocks_group.setObjectName("stockListGroup")  # 添加特殊ID以便应用样式
         
-        # 添加复选框组
+        stock_layout = QVBoxLayout()
+        stock_layout.setSpacing(8)  # 减少子区域之间的间距（从15改为8）
+        
+        # 直接添加复选框布局，不使用组框
         self.stock_checkboxes = {}
         self.stock_files = {}
         stock_types = {
@@ -1861,6 +2251,8 @@ class StockDataProcessorGUI(QMainWindow):
         
         # 创建复选框网格布局
         checkbox_layout = QGridLayout()
+        checkbox_layout.setVerticalSpacing(5)  # 减少垂直间距（从10改为5）
+        checkbox_layout.setHorizontalSpacing(10)  # 减少水平间距（从15改为10）
         row = 0
         col = 0
         for stock_type, display_name in stock_types.items():
@@ -1875,12 +2267,10 @@ class StockDataProcessorGUI(QMainWindow):
                 custom_label = QLabel(display_name)
                 custom_label.setStyleSheet("""
                     QLabel {
-                        color: #3DAEE9;
-                        text-decoration: underline;
+                        color: #f0f0f0;  /* 使用与普通文本相同的颜色 */
+                        text-decoration: underline;  /* 保留下划线 */
                         cursor: pointer;
-                    }
-                    QLabel:hover {
-                        color: #2980B9;
+                        font-weight: bold;
                     }
                 """)
                 custom_label.setCursor(Qt.PointingHandCursor)
@@ -1904,39 +2294,54 @@ class StockDataProcessorGUI(QMainWindow):
         
         stock_layout.addLayout(checkbox_layout)
         
-        # 自定义列表部分
-        custom_group = QGroupBox("自定义列表")
+        # 直接添加自定义列表按钮，不使用组框
         custom_layout = QHBoxLayout()
         
+        # 根据字体缩放比例动态计算按钮高度
+        button_height = int(32 * self.font_scale)  # 基础高度32px，根据缩放比例调整
+        
         browse_button = QPushButton("添加自定义列表")
+        browse_button.setMinimumHeight(button_height)  # 使用最小高度而不是最大高度
         browse_button.clicked.connect(self.add_custom_stock_file)
         custom_layout.addWidget(browse_button)
         
         clear_button = QPushButton("清空列表")
+        clear_button.setMinimumHeight(button_height)  # 使用最小高度而不是最大高度
         clear_button.clicked.connect(self.clear_stock_files)
         custom_layout.addWidget(clear_button)
         
         custom_layout.addStretch()
         
-        custom_group.setLayout(custom_layout)
-        stock_layout.addWidget(custom_group)
+        stock_layout.addLayout(custom_layout)
         
         # 添加已选文件预览
         preview_group = QGroupBox("已选列表预览")
+        preview_group.setObjectName("stockPreviewGroup")  # 添加子区域ID
         preview_layout = QVBoxLayout()
+        preview_layout.setContentsMargins(8, 8, 8, 8)  # 减少内边距
         self.stock_files_preview = QTextEdit()
+        self.stock_files_preview.setObjectName("stockFilesPreview")  # 添加预览文本区域ID
         self.stock_files_preview.setReadOnly(True)
-        self.stock_files_preview.setMaximumHeight(100)
-        preview_layout.addWidget(self.stock_files_preview)
+        # 移除固定最大高度限制，设置最小高度和大小策略让其能够自适应
+        self.stock_files_preview.setMinimumHeight(60)
+        from PyQt5.QtWidgets import QSizePolicy
+        self.stock_files_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        preview_layout.addWidget(self.stock_files_preview, 1)  # 添加伸展因子
         preview_group.setLayout(preview_layout)
-        stock_layout.addWidget(preview_group)
+        # 为预览组设置大小策略，让它能够扩展
+        preview_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # 添加预览组到股票布局时设置伸展因子
+        stock_layout.addWidget(preview_group, 1)  # 伸展因子为1
         
         # 连接复选框信号
         for checkbox in self.stock_checkboxes.values():
             checkbox.stateChanged.connect(self.update_stock_files_preview)
         
-        stock_group.setLayout(stock_layout)
-        layout.addWidget(stock_group)
+        stocks_group.setLayout(stock_layout)
+        # 为整个股票组设置大小策略，让它能够扩展
+        stocks_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # 添加股票组到主布局时设置伸展因子
+        layout.addWidget(stocks_group, 1)  # 伸展因子为1，让它占据更多空间
 
     def clear_stock_files(self):
         """清空股票列表预览"""
@@ -2023,14 +2428,24 @@ class StockDataProcessorGUI(QMainWindow):
                     elif stock_type == 'sz50':
                         filename = os.path.join(data_dir, "上证50成分股_股票列表.csv")
                     elif stock_type == 'custom':
-                        custom_file = os.path.join(data_dir, "otheridx.csv")
+                        custom_file = self.get_custom_list_path()
                         if os.path.exists(custom_file):
                             filename = custom_file
                         else:
-                            # 如果自选清单文件不存在，创建一个空文件
+                            # 如果自选清单文件不存在，创建一个示例文件
                             try:
+                                # 确保目录存在
+                                os.makedirs(os.path.dirname(custom_file), exist_ok=True)
+                                
+                                # 创建示例自选清单文件
+                                sample_content = """股票代码,股票名称
+000001.SZ,平安银行
+000002.SZ,万科A
+600000.SH,浦发银行
+600036.SH,招商银行
+000858.SZ,五粮液"""
                                 with open(custom_file, 'w', encoding='utf-8') as f:
-                                    f.write("code,name\n")  # 写入表头
+                                    f.write(sample_content)
                                 filename = custom_file
                                 logging.info(f"已创建新的自选清单文件: {custom_file}")
                             except Exception as e:
@@ -2065,6 +2480,13 @@ class StockDataProcessorGUI(QMainWindow):
 
     def download_data(self):
         try:
+            # 如果下载线程正在运行，点击按钮就停止下载
+            if hasattr(self, 'download_thread') and self.download_thread and self.download_thread.isRunning():
+                self.download_thread.stop()
+                self.status_label.setText("下载已停止")
+                self.reset_download_button()
+                return
+                
             logging.info("开始准备下载数据")
             
             # 验证日期和时间范围
@@ -2078,7 +2500,7 @@ class StockDataProcessorGUI(QMainWindow):
                 try:
                     self.download_thread.stop()
                     self.download_thread.wait()
-                except:
+                except: # noqa: E722
                     pass
 
             selected_fields = [field for field, checkbox in self.field_checkboxes.items() if checkbox.isChecked()]
@@ -2115,32 +2537,61 @@ class StockDataProcessorGUI(QMainWindow):
 
             # 准备下载参数
             try:
-                from khQTTools import download_and_store_data
-                download_and_store_data(
-                    local_data_path=local_data_path,
-                    stock_files=selected_files,
-                    field_list=selected_fields,
-                    period_type=period_type,
-                    start_date=self.start_date_edit.date().toString('yyyyMMdd'),
-                    end_date=self.end_date_edit.date().toString('yyyyMMdd'),
-                    dividend_type=dividend_type,
-                    progress_callback=self.update_progress,
-                    log_callback=self.update_status
-                )
-                QMessageBox.information(self, "完成", "数据下载完成！")
+                # 获取时间范围
+                time_range = 'all'
+                if self.use_all_time_checkbox.currentIndex() == 0:  # 指定时间段
+                    start_time = self.start_time_edit.time().toString("HH:mm")
+                    end_time = self.end_time_edit.time().toString("HH:mm")
+                    time_range = f"{start_time}-{end_time}"
+                
+                # 准备参数字典
+                params = {
+                    'local_data_path': local_data_path,
+                    'stock_files': selected_files,
+                    'field_list': selected_fields,
+                    'period_type': period_type,
+                    'start_date': self.start_date_edit.date().toString('yyyyMMdd'),
+                    'end_date': self.end_date_edit.date().toString('yyyyMMdd'),
+                    'dividend_type': dividend_type,
+                    'time_range': time_range
+                }
+                
+                # 创建并启动下载线程
+                if hasattr(self, 'supplement_button'):
+                    self.supplement_button.setEnabled(False)
+                self.progress_bar.setValue(0)
+                self.status_label.setText("正在下载数据...")
+                
+                # 更改下载按钮为停止下载按钮
+                self.download_button.setText("停止下载")
+                self.download_button.setStyleSheet("background-color: #E74C3C;")
+                
+                self.download_thread = DownloadThread(params, self)
+                self.download_thread.progress.connect(self.update_progress)
+                self.download_thread.finished.connect(self.download_finished)
+                self.download_thread.error.connect(self.handle_download_error)
+                self.download_thread.status_update.connect(self.update_status)
+                self.download_thread.start()
+                
             except Exception as e:
-                logging.error(f"下载数据时出错: {str(e)}")
-                QMessageBox.critical(self, "错误", f"下载数据时出错: {str(e)}")
+                logging.error(f"启动下载线程时出错: {str(e)}", exc_info=True)
+                QMessageBox.critical(self, "错误", f"启动下载线程时出错: {str(e)}")
+                self.reset_download_button()
+                if hasattr(self, 'supplement_button'):
+                    self.supplement_button.setEnabled(True)
 
         except Exception as e:
             logging.error(f"准备下载数据时出错: {str(e)}")
             QMessageBox.critical(self, "错误", f"准备下载数据时出错: {str(e)}")
+            self.reset_download_button()
 
     def handle_download_error(self, error_msg):
         """处理下载错误"""
         logging.error(f"下载错误: {error_msg}")
         QMessageBox.critical(self, "下载错误", error_msg)
-        self.download_button.setEnabled(True)
+        self.reset_download_button()
+        # 清除线程引用
+        self.download_thread = None
         self.status_label.setText("下载失败")
 
     def update_progress(self, value):
@@ -2148,6 +2599,9 @@ class StockDataProcessorGUI(QMainWindow):
 
     def download_finished(self, success, message):
         self.reset_download_button()
+        # 清除线程引用
+        self.download_thread = None
+        
         if success:
             custom_msg_box = QMessageBox(self)
             custom_msg_box.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
@@ -2250,6 +2704,7 @@ class StockDataProcessorGUI(QMainWindow):
                 checkbox.setChecked(True)  # 新字段默认选中
             self.field_checkboxes[field] = checkbox
             self.field_layout.addWidget(checkbox, i // 4, i % 4)
+            
     def add_field_group(self, layout, title_font):
         self.field_group = QGroupBox("要存储的字段列表")
         self.field_group.setFont(title_font)
@@ -2291,6 +2746,7 @@ class StockDataProcessorGUI(QMainWindow):
         }
         
         self.update_field_checkboxes()
+        
     def add_period_group(self, layout, title_font):
         # 创建水平布局来容纳两个组
         h_layout = QHBoxLayout()
@@ -2300,7 +2756,8 @@ class StockDataProcessorGUI(QMainWindow):
         period_group.setFont(title_font)
         period_layout = QHBoxLayout()
 
-        self.period_type_combo = QComboBox()
+        # 周期类型下拉框
+        self.period_type_combo = NoWheelComboBox()
         self.period_type_combo.addItems(['tick', '1m', '5m', '1d'])
         self.period_type_combo.currentTextChanged.connect(self.update_field_checkboxes)
         period_layout.addWidget(self.period_type_combo)
@@ -2308,7 +2765,7 @@ class StockDataProcessorGUI(QMainWindow):
         h_layout.addWidget(period_group)
 
         # 复权方式组
-        dividend_group = QGroupBox("复权方式（仅针对下载数据）")
+        dividend_group = QGroupBox("复权方式")
         dividend_group.setFont(title_font)
         dividend_layout = QVBoxLayout()
 
@@ -2318,7 +2775,7 @@ class StockDataProcessorGUI(QMainWindow):
         dividend_layout.addWidget(note_label)
 
         # 复权选择下拉框
-        self.dividend_type_combo = QComboBox()
+        self.dividend_type_combo = NoWheelComboBox()
         self.dividend_type_combo.addItem("不复权", "none")
         self.dividend_type_combo.addItem("前复权", "front")
         self.dividend_type_combo.addItem("后复权", "back")
@@ -2338,18 +2795,44 @@ class StockDataProcessorGUI(QMainWindow):
         date_group.setFont(title_font)
         date_layout = QHBoxLayout()
         
+        # 从QSettings读取保存的日期设置
+        settings = QSettings('KHQuant', 'StockAnalyzer')
+        
+        # 设置合理的默认日期：今年年初到今天
+        from datetime import datetime
+        current_year = datetime.now().year
+        today = datetime.now()
+        default_start_date = QDate(current_year, 1, 1)
+        default_end_date = QDate(today.year, today.month, today.day)
+        
+        # 读取保存的日期，如果没有则使用默认值
+        saved_start_date = settings.value('start_date', default_start_date.toString('yyyy-MM-dd'))
+        saved_end_date = settings.value('end_date', default_end_date.toString('yyyy-MM-dd'))
+        
         start_date_layout = QHBoxLayout()
         start_date_layout.addWidget(QLabel("起始日期:"))
-        self.start_date_edit = QDateEdit()
+        self.start_date_edit = NoWheelDateEdit()
         self.start_date_edit.setCalendarPopup(True)
-        self.start_date_edit.setDate(QDate(2024, 1, 1))
+        # 从字符串解析日期
+        if isinstance(saved_start_date, str):
+            self.start_date_edit.setDate(QDate.fromString(saved_start_date, 'yyyy-MM-dd'))
+        else:
+            self.start_date_edit.setDate(default_start_date)
+        # 添加信号连接，当日期改变时保存设置
+        self.start_date_edit.dateChanged.connect(self.save_date_settings)
         start_date_layout.addWidget(self.start_date_edit)
         
         end_date_layout = QHBoxLayout()
         end_date_layout.addWidget(QLabel("结束日期:"))
-        self.end_date_edit = QDateEdit()
+        self.end_date_edit = NoWheelDateEdit()
         self.end_date_edit.setCalendarPopup(True)
-        self.end_date_edit.setDate(QDate(2024, 2, 1))
+        # 从字符串解析日期
+        if isinstance(saved_end_date, str):
+            self.end_date_edit.setDate(QDate.fromString(saved_end_date, 'yyyy-MM-dd'))
+        else:
+            self.end_date_edit.setDate(default_end_date)
+        # 添加信号连接，当日期改变时保存设置
+        self.end_date_edit.dateChanged.connect(self.save_date_settings)
         end_date_layout.addWidget(self.end_date_edit)
         
         date_layout.addLayout(start_date_layout)
@@ -2375,29 +2858,54 @@ class StockDataProcessorGUI(QMainWindow):
         time_group.setFont(title_font)
         time_layout = QHBoxLayout()
         
+        # 从QSettings读取保存的时间设置
+        settings = QSettings('KHQuant', 'StockAnalyzer')
+        
+        # 设置默认值
+        default_time_range_mode = 1  # 默认选择"全天"
+        default_start_time = QTime(9, 30)
+        default_end_time = QTime(15, 0)
+        
+        # 读取保存的时间设置
+        saved_time_range_mode = settings.value('time_range_mode', default_time_range_mode, type=int)
+        saved_start_time = settings.value('start_time', default_start_time.toString('HH:mm'))
+        saved_end_time = settings.value('end_time', default_end_time.toString('HH:mm'))
+        
         # 添加时间范围选择下拉框
-        self.use_all_time_checkbox = QComboBox()
+        self.use_all_time_checkbox = NoWheelComboBox()
         self.use_all_time_checkbox.addItems(['指定时间段', '全天'])
-        self.use_all_time_checkbox.setCurrentIndex(1)  # 默认选择"全天"
+        self.use_all_time_checkbox.setCurrentIndex(saved_time_range_mode)  # 使用保存的选择
         self.use_all_time_checkbox.currentIndexChanged.connect(self.toggle_time_range)
+        self.use_all_time_checkbox.currentIndexChanged.connect(self.save_time_settings)  # 添加保存信号
         time_layout.addWidget(self.use_all_time_checkbox)
         
         # 添加时间选择控件
         time_layout.addWidget(QLabel("开始时间:"))
-        self.start_time_edit = QTimeEdit()
-        self.start_time_edit.setTime(QTime(9, 30))
+        self.start_time_edit = NoWheelTimeEdit()
+        # 从字符串解析时间
+        if isinstance(saved_start_time, str):
+            self.start_time_edit.setTime(QTime.fromString(saved_start_time, 'HH:mm'))
+        else:
+            self.start_time_edit.setTime(default_start_time)
         self.start_time_edit.timeChanged.connect(self.validate_time_range)
+        self.start_time_edit.timeChanged.connect(self.save_time_settings)  # 添加保存信号
         time_layout.addWidget(self.start_time_edit)
         
         time_layout.addWidget(QLabel("结束时间:"))
-        self.end_time_edit = QTimeEdit()
-        self.end_time_edit.setTime(QTime(15, 0))
+        self.end_time_edit = NoWheelTimeEdit()
+        # 从字符串解析时间
+        if isinstance(saved_end_time, str):
+            self.end_time_edit.setTime(QTime.fromString(saved_end_time, 'HH:mm'))
+        else:
+            self.end_time_edit.setTime(default_end_time)
         self.end_time_edit.timeChanged.connect(self.validate_time_range)
+        self.end_time_edit.timeChanged.connect(self.save_time_settings)  # 添加保存信号
         time_layout.addWidget(self.end_time_edit)
         
         # 根据当前选择设置时间编辑器的启用状态
-        self.start_time_edit.setEnabled(False)
-        self.end_time_edit.setEnabled(False)
+        use_all_time = (saved_time_range_mode == 1)  # 1 表示选择了"全天"
+        self.start_time_edit.setEnabled(not use_all_time)
+        self.end_time_edit.setEnabled(not use_all_time)
         
         time_group.setLayout(time_layout)
         layout.addWidget(time_group)
@@ -2432,16 +2940,10 @@ class StockDataProcessorGUI(QMainWindow):
         button_layout = QHBoxLayout()
         
         # 下载数据按钮
-        self.download_button = QPushButton("下载数据（数据下载时UI界面会进入未响应状态，如要终止下载直接关闭软件）")
+        self.download_button = QPushButton("下载数据")
         self.download_button.setMinimumHeight(40)
         self.download_button.clicked.connect(self.download_data)
         button_layout.addWidget(self.download_button)
-        
-        # 补充数据按钮
-        self.supplement_button = QPushButton("补充数据")
-        self.supplement_button.setMinimumHeight(40)
-        self.supplement_button.clicked.connect(self.supplement_data)
-        button_layout.addWidget(self.supplement_button)
         
         download_layout.addLayout(button_layout)
 
@@ -2456,11 +2958,26 @@ class StockDataProcessorGUI(QMainWindow):
     def supplement_data(self):
         """补充数据按钮点击事件处理"""
         try:
+            # 如果补充数据线程正在运行，点击按钮就停止补充
+            if hasattr(self, 'supplement_thread') and self.supplement_thread and self.supplement_thread.isRunning():
+                self.supplement_thread.stop()
+                self.status_label.setText("补充数据已停止")
+                self.reset_supplement_button()
+                return
+                
             # 验证日期和时间范围
             if not self.validate_date_range():
                 return
             if not self.validate_time_range():
                 return
+            
+            # 清理之前的线程（如果存在）
+            if hasattr(self, 'supplement_thread') and self.supplement_thread:
+                try:
+                    self.supplement_thread.stop()
+                    self.supplement_thread.wait()
+                except: # noqa: E722
+                    pass
             
             # 获取选中的股票文件列表
             stock_files = []
@@ -2496,39 +3013,50 @@ class StockDataProcessorGUI(QMainWindow):
                 end_time = self.end_time_edit.time().toString("HH:mm")
                 time_range = f"{start_time}-{end_time}"
 
+            # 获取复权方式
+            dividend_type = self.dividend_type_combo.currentData()
+            if dividend_type is None:  # 如果没有设置currentData，则使用currentText
+                dividend_type = self.dividend_type_combo.currentText()
+
             # 更新按钮状态
-            self.supplement_button.setEnabled(False)
             self.download_button.setEnabled(False)
             self.progress_bar.setValue(0)
+            self.status_label.setText("正在补充数据...")
+            
+            # 更改补充数据按钮为停止按钮
+            if hasattr(self, 'supplement_button'):
+                self.supplement_button.setText("停止补充")
+                self.supplement_button.setStyleSheet("background-color: #E74C3C;")
 
             try:
-                # 调用补充数据函数，不传递复权参数
-                supplement_history_data(
-                    stock_files=stock_files,
-                    field_list=field_list,
-                    period_type=period_type,
-                    start_date=start_date,
-                    end_date=end_date,
-                    time_range=time_range,
-                    progress_callback=self.update_progress,
-                    log_callback=self.update_status
-                )
+                # 准备参数字典
+                params = {
+                    'stock_files': stock_files,
+                    'field_list': field_list,
+                    'period_type': period_type,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'time_range': time_range,
+                    'dividend_type': dividend_type
+                }
                 
-                QMessageBox.information(self, "完成", "数据补充完成！")
+                # 创建并启动补充数据线程
+                self.supplement_thread = SupplementThread(params, self)
+                self.supplement_thread.progress.connect(self.update_progress)
+                self.supplement_thread.finished.connect(self.supplement_finished)
+                self.supplement_thread.error.connect(self.handle_supplement_error)
+                self.supplement_thread.status_update.connect(self.update_status)
+                self.supplement_thread.start()
                 
             except Exception as e:
-                QMessageBox.critical(self, "错误", f"补充数据时出错：{str(e)}")
-                logging.error(f"补充数据时出错: {str(e)}", exc_info=True)
-            
-            finally:
-                # 恢复按钮状态
-                self.supplement_button.setEnabled(True)
-                self.download_button.setEnabled(True)
-                self.progress_bar.setValue(0)
+                QMessageBox.critical(self, "错误", f"启动补充数据线程时出错：{str(e)}")
+                logging.error(f"启动补充数据线程时出错: {str(e)}", exc_info=True)
+                self.reset_supplement_button()
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"准备补充数据时出错：{str(e)}")
             logging.error(f"准备补充数据时出错: {str(e)}", exc_info=True)
+            self.reset_supplement_button()
 
     # 数据清洗相关方法
     def load_folder_info(self, folder_path):
@@ -2565,18 +3093,6 @@ class StockDataProcessorGUI(QMainWindow):
             error_msg = f"加载文件夹信息时出错: {str(e)}"
             logging.error(error_msg)
             QMessageBox.warning(self, "加载错误", error_msg)
-
-
-    def load_folder_info(self, folder_path):
-        try:
-            csv_files = [f for f in os.listdir(folder_path) if f.endswith('.csv')]
-            info_text = f"文件夹内CSV文件数量: {len(csv_files)}\n\n"
-            info_text += "文件列表:\n"
-            for file in csv_files:
-                info_text += f"- {file}\n"
-            self.preview_text.setText(info_text)
-        except Exception as e:
-            QMessageBox.warning(self, "加载错误", f"加载文件夹信息时出错: {str(e)}")
 
     def start_cleaning(self):
         folder_path = self.folder_path_label.text()
@@ -2705,109 +3221,9 @@ class StockDataProcessorGUI(QMainWindow):
 
     # 其他通用方法实现
     def apply_styles(self):
-        # 保持原有的样式设置
-        self.setStyleSheet("""
-        QWidget#toolbarWidget {
-            background-color: #2D2D2D;
-            border-top: 1px solid #3D3D3D;
-            border-bottom: 1px solid #3D3D3D;
-        }
-        QPushButton#toolbarButton {
-            background-color: transparent;
-            border: none;
-            border-radius: 5px;
-            padding: 5px;
-        }
-        QPushButton#toolbarButton:hover {
-            background-color: #3D3D3D;
-        }
-        QPushButton#toolbarButton:pressed {
-            background-color: #1E1E1E;
-        }
-        QMainWindow {
-            background-color: #1E1E1E;
-            border: 1px solid #3D3D3D;
-        }
-        QWidget {
-            background-color: #1E1E1E;
-            color: #E0E0E0;
-        }
-        QPushButton#minButton, QPushButton#maxButton, QPushButton#closeButton {
-            background-color: transparent;
-            color: #E0E0E0;
-            border: none;
-            font-size: 24px;
-        }
-        QPushButton#minButton:hover, QPushButton#maxButton:hover {
-            background-color: #3D3D3D;
-        }
-        QPushButton#closeButton:hover {
-            background-color: #E81123;
-        }
-        QScrollArea {
-            border: none;
-        }
-        QGroupBox {
-            border: 2px solid #3D3D3D;
-            border-radius: 5px;
-            margin-top: 20px;
-            padding-top: 10px;
-            font-weight: bold;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            top: 8px;
-            padding: 0 3px 0 3px;
-            font-size: 18px;
-        }
-        QLabel {
-            color: #E0E0E0;
-        }
-        QLineEdit, QTextEdit, QDateEdit, QTimeEdit, QComboBox {
-            background-color: #2D2D2D;
-            border: 1px solid #3D3D3D;
-            border-radius: 3px;
-            padding: 5px;
-            color: #E0E0E0;
-        }
-        QPushButton {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4A4A4A, stop:1 #2E2E2E);
-            border: none;
-            color: #E0E0E0;
-            padding: 8px;
-            border-radius: 3px;
-        }
-        QPushButton:hover {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5A5A5A, stop:1 #3E3E3E);
-        }
-        QPushButton:pressed {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3A3A3A, stop:1 #1E1E1E);
-        }
-        QProgressBar {
-            border: 2px solid #3D3D3D;
-            border-radius: 5px;
-            text-align: center;
-        }
-        QProgressBar::chunk {
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3DAEE9, stop:1 #2980B9);
-        }
-        QCheckBox {
-            spacing: 5px;
-        }
-        QCheckBox::indicator {
-            width: 18px;
-            height: 18px;
-        }
-        QCheckBox::indicator:unchecked {
-            border: 2px solid #3D3D3D;
-            background-color: #2D2D2D;
-        }
-        QCheckBox::indicator:checked {
-            border: 2px solid #3DAEE9;
-            background-color: #3DAEE9;
-        }
-        """)
+        # 使用根据分辨率缩放的样式表
+        self.setStyleSheet(self.get_scaled_stylesheet())
+
     def open_visualization(self):
         """打开数据可视化窗口"""
         if not hasattr(self, 'visualization_window') or not self.visualization_window:
@@ -2820,8 +3236,22 @@ class StockDataProcessorGUI(QMainWindow):
         self.visualization_window.show()
         self.visualization_window.raise_()
         self.visualization_window.activateWindow()
-    # 添加其他必要的方法
 
+    def show_help(self):
+        """打开在线教程页面"""
+        try:
+            from PyQt5.QtCore import QUrl
+            from PyQt5.QtGui import QDesktopServices
+            
+            # 打开教程网址
+            url = QUrl("https://khsci.com/khQuant/tutorial/") # 使用正确的教程链接
+            QDesktopServices.openUrl(url)
+            
+            logging.info("已打开在线教程页面")
+        except Exception as e:
+            error_msg = f"打开教程页面失败: {str(e)}"
+            logging.error(error_msg)
+            QMessageBox.critical(self, "错误", error_msg)
 
     def check_software_status(self):
         """检查MiniQMT软件状态并更新指示器"""
@@ -2850,22 +3280,11 @@ class StockDataProcessorGUI(QMainWindow):
             logging.error(f"检查软件状态时出错: {str(e)}")
             self.update_status_indicator("red", "状态检查失败")
 
-    def show_help(self):
-        help_dialog = HelpDialog(self)
-        help_dialog.exec_()
-
-    # 保持原有的其他方法实现...
-
-    def toggle_time_range(self, index):
-        """切换时间范围选择"""
-        use_all_time = (index == 1)  # 1 表示选择了"全天"
-        self.start_time_edit.setEnabled(not use_all_time)
-        self.end_time_edit.setEnabled(not use_all_time)
-
     def show(self):
-        """重写show方法，移除激活检查"""
+        """重写show方法，默认最大化窗口"""
         try:
             super().show()
+            self.showMaximized()  # 默认最大化窗口
             
             # 延迟检查更新
             QTimer.singleShot(2000, self.delayed_update_check)
@@ -2874,13 +3293,6 @@ class StockDataProcessorGUI(QMainWindow):
             logging.error(f"显示主窗口时出错: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "错误", f"启动程序时出错: {str(e)}")
             QApplication.quit()
-
-    def delayed_update_check(self):
-        """延迟执行更新检查"""
-        try:
-            self.check_for_updates()
-        except Exception as e:
-            logging.error(f"延迟更新检查时出错: {str(e)}", exc_info=True)
 
     def add_home_button(self):
         """添加主页按钮"""
@@ -2909,63 +3321,236 @@ class StockDataProcessorGUI(QMainWindow):
 
     def toggle_download(self):
         """切换下载状态"""
-        if hasattr(self, 'download_thread') and self.download_thread:
+        if hasattr(self, 'download_thread') and self.download_thread and self.download_thread.isRunning():
             # 停止下载
-            if self.download_thread:
-                self.download_thread.stop()
-                self.status_label.setText("下载已停止")
+            self.download_thread.stop()
+            self.status_label.setText("下载已停止")
             self.reset_download_button()
+            # 清除线程引用
+            self.download_thread = None
         else:
             # 开始下载
             self.download_data()
 
     def reset_download_button(self):
         """重置下载按钮状态"""
+        self.download_button.setText("下载数据")
+        self.download_button.setStyleSheet("")
+        self.download_button.setEnabled(True)
+        if hasattr(self, 'supplement_button'):
+            self.supplement_button.setEnabled(True)
+
+    def reset_supplement_button(self):
+        """重置补充数据按钮状态"""
+        if hasattr(self, 'supplement_button'):
+            self.supplement_button.setText("补充数据")
+            self.supplement_button.setStyleSheet("")
+            self.supplement_button.setEnabled(True)
         self.download_button.setEnabled(True)
 
     def open_custom_list(self, event):
         """打开自选清单文件"""
         try:
-            # 获取自选清单文件路径
-            data_dir = os.path.join(os.path.dirname(__file__), 'data')
-            custom_file = os.path.join(data_dir, 'otheridx.csv')
+            # 获取自选清单文件路径 - 使用用户可写目录
+            custom_file = self.get_custom_list_path()
             
+            # 如果文件不存在，创建一个示例文件
+            if not os.path.exists(custom_file):
+                try:
+                    # 确保目录存在
+                    os.makedirs(os.path.dirname(custom_file), exist_ok=True)
+                    
+                    # 创建示例自选清单文件
+                    sample_content = """股票代码,股票名称
+000001.SZ,平安银行
+000002.SZ,万科A
+600000.SH,浦发银行
+600036.SH,招商银行
+000858.SZ,五粮液"""
+                    with open(custom_file, 'w', encoding='utf-8') as f:
+                        f.write(sample_content)
+                    logging.info(f"已创建示例自选清单文件: {custom_file}")
+                except Exception as create_error:
+                    QMessageBox.warning(self, "错误", f"创建自选清单文件失败: {str(create_error)}")
+                    logging.error(f"创建自选清单文件失败: {str(create_error)}")
+                    return
+            
+            # 打开文件
             if os.path.exists(custom_file):
                 if sys.platform == 'win32':
                     os.startfile(custom_file)
-                else:
-                    import subprocess
+                elif sys.platform == 'darwin':  # macOS
+                    subprocess.call(['open', custom_file])
+                else:  # linux
                     subprocess.call(['xdg-open', custom_file])
                 logging.info(f"已打开自选清单文件: {custom_file}")
             else:
-                # 如果文件不存在，创建一个空的自选清单文件
-                try:
-                    with open(custom_file, 'w', encoding='utf-8') as f:
-                        f.write("code,name\n")  # 写入表头
-                    if sys.platform == 'win32':
-                        os.startfile(custom_file)
-                    else:
-                        import subprocess
-                        subprocess.call(['xdg-open', custom_file])
-                    logging.info(f"已创建并打开新的自选清单文件: {custom_file}")
-                except Exception as e:
-                    QMessageBox.warning(self, "错误", f"创建自选清单文件失败: {str(e)}")
-                    logging.error(f"创建自选清单文件失败: {str(e)}")
+                QMessageBox.warning(self, "错误", "找不到自选清单文件")
+                
         except Exception as e:
             QMessageBox.warning(self, "错误", f"打开自选清单文件失败: {str(e)}")
             logging.error(f"打开自选清单文件失败: {str(e)}")
+    
+    def get_custom_list_path(self):
+        """获取自选清单文件的路径"""
+        if getattr(sys, 'frozen', False):
+            # 打包环境 - 使用用户文档目录
+            user_docs = os.path.expanduser("~/Documents")
+            khquant_dir = os.path.join(user_docs, "KHQuant", "data")
+            return os.path.join(khquant_dir, "otheridx.csv")
+        else:
+            # 开发环境 - 使用原路径
+            data_dir = os.path.join(os.path.dirname(__file__), 'data')
+            return os.path.join(data_dir, 'otheridx.csv')
 
     def update_status(self, message):
         """更新状态信息"""
         try:
-            # 在状态栏显示消息
-            self.statusBar().showMessage(message)
-            # 确保消息立即显示
-            QApplication.processEvents()
-            # 记录日志
-            logging.info(message)
+            # 使用status_label显示消息，而不是statusBar
+            if hasattr(self, 'status_label'):
+                # 设置工具提示，显示完整消息
+                self.status_label.setToolTip(message)
+                
+                # 计算能显示的文字长度（基于字体和宽度估算）
+                # 假设每个字符约8像素宽，状态容器最大宽度500px，减去一些边距
+                chars_per_line = (500 - 20) // 8  # 约60个字符一行
+                max_chars_for_two_lines = chars_per_line * 2
+                
+                displayed_message = message
+                if len(message) > max_chars_for_two_lines:
+                    # 如果超过两行的字符数，截断并添加省略号
+                    displayed_message = message[:max_chars_for_two_lines-3] + "..."
+                
+                self.status_label.setText(displayed_message)
+                
+                # 确保消息立即显示
+                QApplication.processEvents()
+                
+                # 记录完整消息以便参考
+                logging.info(f"状态更新: {message}")
         except Exception as e:
             logging.error(f"更新状态信息时出错: {str(e)}")
+
+    def supplement_finished(self, success, message):
+        """处理补充数据线程完成事件"""
+        self.reset_supplement_button()
+        # 清除线程引用
+        self.supplement_thread = None
+
+        if success:
+            # 检查是否没有下载到新数据
+            if "没有下载到新数据" in message:
+                self.status_label.setText("补充数据完成，未发现新数据可供下载。")
+            else:
+                # 显示成功的弹窗
+                custom_msg_box = QMessageBox(self)
+                custom_msg_box.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+                custom_msg_box.setText(message)
+                custom_msg_box.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #F0F0F0;
+                        border: 1px solid #D0D0D0;
+                        border-radius: 10px;
+                    }
+                    QMessageBox QLabel {
+                        background-color: #F0F0F0;
+                        color: #2C3E50;
+                        font-size: 24px;
+                        padding: 20px;
+                    }
+                """)
+                ok_button = custom_msg_box.addButton(QMessageBox.Ok)
+                ok_button.setMinimumSize(120, 50)
+                ok_button.setStyleSheet("""
+                    QPushButton {
+                        font-size: 18px;
+                        background-color: #808080;
+                        color: white;
+                        border: none;
+                        padding: 8px;
+                        border-radius: 6px;
+                    }
+                    QPushButton:hover {
+                        background-color: #909090;
+                    }
+                    QPushButton:pressed {
+                        background-color: #707070;
+                    }
+                """)
+                custom_msg_box.exec_()
+                self.status_label.setText(message)  # 成功时也更新底部状态栏
+        else:
+            error_msg_box = QMessageBox(self)
+            error_msg_box.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+            error_msg_box.setIcon(QMessageBox.Critical)
+            error_msg_box.setText(f"补充数据过程中发生错误: {message}")
+            error_msg_box.setStyleSheet("""
+                QMessageBox {
+                    background-color: #F0F0F0;
+                    border: 1px solid #D0D0D0;
+                    border-radius: 10px;
+                }
+                QMessageBox QLabel {
+                    background-color: #F0F0F0;
+                    color: #2C3E50;
+                    font-size: 24px;
+                    padding: 20px;
+                }
+            """)
+            ok_button = error_msg_box.addButton(QMessageBox.Ok)
+            ok_button.setMinimumSize(120, 50)
+            ok_button.setStyleSheet("""
+                QPushButton {
+                    font-size: 24px;
+                    background-color: #808080;
+                    color: white;
+                    border: none;
+                    padding: 8px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #909090;
+                }
+                QPushButton:pressed {
+                    background-color: #707070;
+                }
+            """)
+            error_msg_box.exec_()
+            self.status_label.setText(f"补充数据错误: {message}") # 错误时也更新底部状态栏
+
+        self.progress_bar.setValue(0)
+
+    def handle_supplement_error(self, error_msg):
+        """处理补充数据线程错误事件"""
+        logging.error(f"补充数据错误: {error_msg}")
+        QMessageBox.critical(self, "补充数据错误", error_msg)
+        self.reset_supplement_button()
+        # 清除线程引用
+        self.supplement_thread = None
+        self.status_label.setText("补充数据失败")
+
+    def save_date_settings(self):
+        """保存日期设置到QSettings"""
+        try:
+            settings = QSettings('KHQuant', 'StockAnalyzer')
+            settings.setValue('start_date', self.start_date_edit.date().toString('yyyy-MM-dd'))
+            settings.setValue('end_date', self.end_date_edit.date().toString('yyyy-MM-dd'))
+            settings.sync()
+            logging.debug("日期设置已保存到QSettings")
+        except Exception as e:
+            logging.error(f"保存日期设置时出错: {str(e)}")
+
+    def save_time_settings(self):
+        """保存时间设置到QSettings"""
+        try:
+            settings = QSettings('KHQuant', 'StockAnalyzer')
+            settings.setValue('start_time', self.start_time_edit.time().toString('HH:mm'))
+            settings.setValue('end_time', self.end_time_edit.time().toString('HH:mm'))
+            settings.setValue('time_range_mode', self.use_all_time_checkbox.currentIndex())
+            settings.sync()
+            logging.debug("时间设置已保存到QSettings")
+        except Exception as e:
+            logging.error(f"保存时间设置时出错: {str(e)}")
 
 class CustomSplashScreen(QSplashScreen):
     def __init__(self):
@@ -3059,13 +3644,8 @@ def setup_logging():
         # 在这里设置内部标志
         ENABLE_LOGGING = True  # 将标志设置为 True 开启完整日志，False 则只记录错误
         
-        # 确定日志目录路径
-        if getattr(sys, 'frozen', False):
-            # 打包环境下，使用可执行文件所在目录
-            base_path = os.path.dirname(sys.executable)
-        else:
-            # 开发环境下，使用当前文件所在目录
-            base_path = os.path.dirname(os.path.abspath(__file__))
+        # 确定日志目录路径 - 源码模式
+        base_path = os.path.dirname(os.path.abspath(__file__))
         
         logs_dir = os.path.join(base_path, 'logs')
         os.makedirs(logs_dir, exist_ok=True)
@@ -3103,7 +3683,7 @@ def setup_logging():
             logging.info("="*50)
             logging.info("应用程序启动")
             logging.info(f"日志文件路径: {log_filename}")
-            logging.info(f"运行模式: {'打包环境' if getattr(sys, 'frozen', False) else '开发环境'}")
+            logging.info(f"运行模式: 源码环境")
             logging.info(f"Python版本: {sys.version}")
             logging.info(f"操作系统: {sys.platform}")
             logging.info("="*50)
@@ -3150,6 +3730,9 @@ if __name__ == '__main__':
     from datetime import datetime
     import time
     
+    # 支持多进程
+    multiprocessing.freeze_support()
+    
     # 日志配置部分
     log_filename = setup_logging()
     
@@ -3157,11 +3740,8 @@ if __name__ == '__main__':
         logging.info("程序启动")
         app = QApplication(sys.argv)
         
-        # 修改图标路径获取方式
-        if getattr(sys, 'frozen', False):
-            ICON_PATH = os.path.join(os.path.dirname(sys.executable), '_internal', 'icons')
-        else:
-            ICON_PATH = os.path.join(os.path.dirname(__file__), 'icons')
+        # 源码模式的图标路径
+        ICON_PATH = os.path.join(os.path.dirname(__file__), 'icons')
             
         logging.info(f"图标路径: {ICON_PATH}")
         
@@ -3177,58 +3757,22 @@ if __name__ == '__main__':
         # 创建主窗口但不显示
         main_window = None
         try:
-            # 创建并显示启动画面
-            splash = None
-            try:
-                splash_img = os.path.join(ICON_PATH, 'splash.png')
-                if os.path.exists(splash_img):
-                    splash = CustomSplashScreen()
-                    splash.show()
-                    app.processEvents()
-                    logging.info("启动画面显示成功")
-                else:
-                    logging.warning("未找到启动画面图片，跳过启动画面显示")
-            except Exception as splash_error:
-                logging.error(f"显示启动画面时出错: {str(splash_error)}")
-                splash = None
-
-            # 创建主窗口
+            # 直接创建主窗口，不显示启动画面
             main_window = StockDataProcessorGUI()
             logging.info("主窗口创建成功")
-
-            if splash:
-                # 模拟加载过程
-                loading_steps = [
-                    (20, "正在初始化系统..."),
-                    (40, "正在检查更新..."),
-                    (60, "正在加载组件..."),
-                    (80, "正在准备用户界面..."),
-                    (100, "启动完成")
-                ]
-                
-                for progress, message in loading_steps:
-                    logging.info(f"加载进度: {progress}% - {message}")
-                    splash.set_progress(progress, message)
-                    app.processEvents()
-                    time.sleep(0.05)
-                
-                # 关闭启动画面
-                splash.close()
-                logging.info("启动画面已关闭")
-                app.processEvents()
 
             def show_main_window():
                 """显示主窗口的辅助函数"""
                 try:
-                                main_window.show()
-                                main_window.raise_()
-                                main_window.activateWindow()
+                    main_window.show()
+                    main_window.raise_()
+                    main_window.activateWindow()
                 except Exception as e:
                     logging.error(f"显示主窗口时出错: {str(e)}", exc_info=True)
                     QMessageBox.critical(None, "错误", f"显示主窗口时出错: {str(e)}")
                     QApplication.quit()
 
-            # 使用短延时确保启动画面完全关闭后再显示主窗口
+            # 使用短延时确保窗口准备好后再显示
             QTimer.singleShot(100, show_main_window)
             
             # 设置定时检查
@@ -3236,9 +3780,8 @@ if __name__ == '__main__':
             status_timer.timeout.connect(main_window.check_software_status)
             status_timer.start(5000)
             
-            # 延迟执行其他初始化操作
+            # 只执行软件状态检查，不执行更新检查
             QTimer.singleShot(200, main_window.check_software_status)
-            QTimer.singleShot(2000, main_window.delayed_update_check)
             
             logging.info("开始事件循环")
             return_code = app.exec_()
@@ -3249,8 +3792,6 @@ if __name__ == '__main__':
             logging.error(f"初始化过程中出错: {str(e)}", exc_info=True)
             if main_window:
                 main_window.close()
-            if splash:
-                splash.close()
             QMessageBox.critical(None, "初始化错误", 
                                f"程序初始化过程中出错:\n{str(e)}\n\n详细信息已写入日志文件")
             sys.exit(1)

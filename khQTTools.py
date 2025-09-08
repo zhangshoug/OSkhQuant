@@ -1,6 +1,23 @@
+# 多进程保护 - 防止在子进程中意外启动Qt应用
+import sys
 import os
+
+# 检查是否在子进程中，只在子进程中设置环境变量
+def is_subprocess():
+    """检查是否在子进程中"""
+    import multiprocessing
+    try:
+        current_process = multiprocessing.current_process()
+        return current_process.name != 'MainProcess'
+    except:
+        return False
+
+# 只在子进程中设置环境变量
+if is_subprocess():
+    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+    os.environ['QT_LOGGING_RULES'] = 'qt.*=false'
+
 import csv
-import os
 import time
 from datetime import datetime, timedelta
 import pandas as pd
@@ -10,9 +27,498 @@ import glob
 import numpy as np
 import logging
 import ast
-from PyQt5.QtCore import QThread, pyqtSignal
+import holidays  # 添加这个导入，用于处理holidays.China()
+from typing import Dict, List, Union, Optional
+import math
+from khTrade import KhTradeManager
+from types import SimpleNamespace
+
+# 延迟导入Qt相关模块，避免在子进程中意外启动Qt应用
+try:
+    if not is_subprocess():
+        # 在主进程中正常导入Qt模块
+        from PyQt5.QtCore import QThread, pyqtSignal
+    else:
+        # 在子进程中创建空的占位符类
+        class QThread:
+            def __init__(self):
+                pass
+            def start(self):
+                pass
+            def run(self):
+                pass
+        
+        def pyqtSignal(*args, **kwargs):
+            return lambda: None
+except ImportError:
+    # 如果导入失败，创建空的占位符类
+    class QThread:
+        def __init__(self):
+            pass
+        def start(self):
+            pass
+        def run(self):
+            pass
+    
+    def pyqtSignal(*args, **kwargs):
+        return lambda: None
 
 
+# ============================================================================
+# 独立函数版本 - 可以直接调用，无需实例化类
+# ============================================================================
+
+# 初始化全局变量
+_trading_periods = [
+    ("093000", "113000"),  # 上午
+    ("130000", "150000")   # 下午
+]
+_cn_holidays = holidays.China()
+
+def is_trade_time() -> bool:
+    """判断是否为交易时间"""
+    current = time.strftime("%H%M%S")
+    
+    for start, end in _trading_periods:
+        if start <= current <= end:
+            return True
+    return False
+
+def is_trade_day(date_str: str = None) -> bool:
+    """判断是否为交易日（工作日且非法定节假日）
+    
+    Args:
+        date_str: 日期字符串，支持格式：
+                 - "YYYY-MM-DD" (如: "2024-12-25")
+                 - "YYYYMMDD" (如: "20241225")
+                 - None (默认为当天)
+        
+    Returns:
+        bool: 是否为交易日
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    
+    # 标准化日期格式
+    try:
+        # 尝试解析不同的日期格式
+        date_obj = None
+        
+        # 格式1: YYYY-MM-DD
+        if '-' in date_str and len(date_str) == 10:
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        # 格式2: YYYYMMDD
+        elif date_str.isdigit() and len(date_str) == 8:
+            date_obj = datetime.strptime(date_str, "%Y%m%d")
+        else:
+            # 尝试其他可能的格式
+            for fmt in ["%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"]:
+                try:
+                    date_obj = datetime.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+        
+        if date_obj is None:
+            raise ValueError(f"无法解析日期格式: {date_str}")
+        
+        # 首先排除周末 (5代表周六, 6代表周日)
+        if date_obj.weekday() >= 5:
+            return False
+        
+        # 使用holidays库判断是否为法定节假日
+        date_only = date_obj.date()
+        if date_only in _cn_holidays:
+            return False
+        
+        # 非周末且非法定节假日，则视为交易日
+        return True
+        
+    except Exception as e:
+        print(f"判断交易日异常: {str(e)}")
+        # 如果出现异常，尝试基本的日期解析
+        try:
+            # 再次尝试解析常见格式
+            date_obj = None
+            for fmt in ["%Y-%m-%d", "%Y%m%d"]:
+                try:
+                    date_obj = datetime.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+            
+            if date_obj is None:
+                print(f"无法解析日期格式: {date_str}，默认按交易日处理")
+                return True
+                
+            date_only = date_obj.date()
+            if date_only in _cn_holidays:
+                print(f"日期 {date_str} 是法定节假日（{_cn_holidays.get(date_only)}），非交易日")
+                return False
+            # 如果是周末，非交易日
+            if date_obj.weekday() >= 5:
+                print(f"日期 {date_str} 是周末，非交易日")
+                return False
+            return True
+        except:
+            # 实在判断不出来，默认为交易日
+            print(f"无法确定 {date_str} 是否为交易日，默认按普通工作日处理")
+            return True
+
+def get_trade_days_count(start_date: str, end_date: str) -> int:
+    """计算指定日期范围内的交易日天数
+    
+    Args:
+        start_date: 起始日期，格式为"YYYY-MM-DD"
+        end_date: 结束日期，格式为"YYYY-MM-DD"
+        
+    Returns:
+        int: 交易日天数
+    """
+    try:
+        # 解析起始和结束日期
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        # 确保开始日期不晚于结束日期
+        if start_dt > end_dt:
+            logging.error(f"起始日期 {start_date} 晚于结束日期 {end_date}")
+            return 0
+            
+        # 初始化计数器
+        trade_days = 0
+        
+        # 遍历日期范围内的每一天
+        current_dt = start_dt
+        while current_dt <= end_dt:
+            current_date_str = current_dt.strftime("%Y-%m-%d")
+            # 使用is_trade_day函数判断是否为交易日
+            if is_trade_day(current_date_str):
+                trade_days += 1
+            
+            # 前进到下一天
+            current_dt += timedelta(days=1)
+            
+        logging.info(f"从 {start_date} 到 {end_date} 共有 {trade_days} 个交易日")
+        return trade_days
+        
+    except Exception as e:
+        logging.error(f"计算交易日天数时出错: {str(e)}")
+        return 0
+
+# ============================================================================
+# 兼容性：保留原有的KhQuTools类，但让类方法调用上面的独立函数
+# ============================================================================
+
+class KhQuTools:
+    """量化工具类（兼容性保留，推荐直接使用模块级函数）"""
+    
+    def __init__(self):
+        # 为了兼容性保留这些属性，但实际会使用模块级函数
+        self.trading_periods = _trading_periods
+        self.cn_holidays = _cn_holidays
+        
+    def is_trade_time(self) -> bool:
+        """判断是否为交易时间（调用模块级函数）"""
+        return is_trade_time()
+        
+    def is_trade_day(self, date_str: str = None) -> bool:
+        """判断是否为交易日（调用模块级函数）"""
+        return is_trade_day(date_str)
+
+    def get_trade_days_count(self, start_date: str, end_date: str) -> int:
+        """计算指定日期范围内的交易日天数（调用模块级函数）"""
+        return get_trade_days_count(start_date, end_date)
+
+    def calculate_moving_average(self, stock_code: str, period: int, field: str = 'close', fre_step: str = '1d', end_time: Optional[str] = None, fq: str = 'pre') -> float:
+        """计算移动平均线
+
+        Args:
+            stock_code: 股票代码
+            period: 周期长度
+            field: 计算字段，默认为'close'
+            fre_step: 时间频率，如'1d', '1m'等
+            end_time: 结束时间，如果为None使用当前时间
+            fq: 复权方式，'pre'前复权, 'post'后复权, 'none'不复权
+
+        Returns:
+            float: 移动平均值
+
+        Raises:
+            ValueError: 如果不在交易时间（日内频率）或数据不足
+        """
+        from datetime import datetime
+        if end_time is None:
+            now = datetime.now()
+            if fre_step in ['1m', '5m', 'tick']:
+                end_time = now.strftime('%Y%m%d %H%M%S')
+            else:
+                end_time = now.strftime('%Y%m%d')
+
+        # 结合 is_trade_time 判断（仅对日内频率）
+        if fre_step in ['1m', '5m', 'tick'] and not self.is_trade_time():
+            raise ValueError("不在交易时间内，无法计算日内移动平均线")
+
+        # 获取历史数据（不包含当前时间点）
+        data = khHistory(
+            symbol_list=stock_code,
+            fields=[field],
+            bar_count=period,
+            fre_step=fre_step,
+            current_time=end_time,
+            fq=fq,
+            force_download=True  # 确保数据最新
+        )
+
+        if stock_code not in data or len(data[stock_code]) < period:
+            raise ValueError(f"股票 {stock_code} 数据量不足 {period} 条，无法计算 MA{period}")
+
+        prices = data[stock_code][field]
+        return round(prices.mean(), 2)
+
+
+def khMA(stock_code: str, period: int, field: str = 'close', fre_step: str = '1d', end_time: Optional[str] = None, fq: str = 'pre') -> float:
+    """计算移动平均线（独立函数版本）
+
+    Args:
+        stock_code: 股票代码
+        period: 周期长度
+        field: 计算字段，默认为'close'
+        fre_step: 时间频率，如'1d', '1m'等
+        end_time: 结束时间，如果为None使用当前时间
+        fq: 复权方式，'pre'前复权, 'post'后复权, 'none'不复权
+
+    Returns:
+        float: 移动平均值
+
+    Raises:
+        ValueError: 如果不在交易时间（日内频率）或数据不足
+    """
+    from datetime import datetime
+    
+    if end_time is None:
+        now = datetime.now()
+        if fre_step in ['1m', '5m', 'tick']:
+            end_time = now.strftime('%Y%m%d %H%M%S')
+        else:
+            end_time = now.strftime('%Y%m%d')
+
+    # 结合 is_trade_time 判断（仅对日内频率）
+    tools = KhQuTools()
+    if fre_step in ['1m', '5m', 'tick'] and not tools.is_trade_time():
+        raise ValueError("不在交易时间内，无法计算日内移动平均线")
+
+    # 获取历史数据（不包含当前时间点）
+    data = khHistory(
+        symbol_list=stock_code,
+        fields=[field],
+        bar_count=period,
+        fre_step=fre_step,
+        current_time=end_time,
+        fq=fq,
+        force_download=False  # 不强制下载数据，提高回测速度
+    )
+
+    if stock_code not in data or len(data[stock_code]) < period:
+        raise ValueError(f"股票 {stock_code} 数据量不足 {period} 条，无法计算均线{period}")
+
+    prices = data[stock_code][field]
+    return round(prices.mean(), 2)
+
+
+def calculate_max_buy_volume(data: Dict, stock_code: str, price: float, cash_ratio: float = 1.0) -> int:
+    """
+    计算最大可买入数量，考虑交易成本（包括滑点）
+
+    Args:
+        data: 策略接收的数据对象，包含账户信息 __account__ 和框架信息 __framework__
+        stock_code: 股票代码
+        price: 当前价格
+        cash_ratio: 使用可用资金的比例，默认为1.0表示使用全部可用资金
+
+    Returns:
+        int: 最大可买入股数(按手取整)
+    """
+    try:
+        # 导入交易管理类
+        from khTrade import KhTradeManager
+
+        # 获取账户信息
+        account_info = data.get("__account__", {})
+        if not account_info:
+            logging.warning("无法获取账户信息，无法计算最大买入量")
+            return 0
+
+        # 获取资金信息
+        available_cash = account_info.get("cash", 0.0)
+
+        # 计算可用的资金
+        usable_cash = available_cash * cash_ratio
+
+        # 防止价格为0导致除零错误
+        if price <= 0:
+            logging.warning(f"股票 {stock_code} 价格异常: {price}，无法计算买入量")
+            return 0
+
+        # 对价格进行四舍五入处理，保留2位小数（A股价格精度为分）
+        price = round(price, 2)
+
+        # 获取框架对象
+        framework = data.get("__framework__", None)
+        
+        # 获取配置对象
+        if framework and hasattr(framework, 'config'):
+            config = framework.config
+        else:
+            logging.warning("未从数据字典中获取到框架对象或框架配置不可用，将使用默认交易成本设置")
+            config = SimpleNamespace(config_dict={"backtest": {"trade_cost": {}}})
+            
+        # 创建交易管理器实例（使用实际配置）
+        trade_manager = KhTradeManager(config)
+        
+        # 获取交易成本参数
+        commission_rate = trade_manager.commission_rate
+        transfer_fee_rate = 0.00001 if stock_code.startswith("sh.") else 0.0  # 沪市股票才有过户费
+        
+        # 估算最大股数 (向下取整到100的倍数)
+        # 使用更精确的初始估算方式
+        estimated_shares = math.floor(usable_cash / price / (1 + commission_rate + transfer_fee_rate))
+        shares = math.floor(estimated_shares / 100) * 100
+
+        # 如果估算股数小于100，则无法买入
+        if shares < 100:
+            return 0
+
+        # 逐步减少股数，使用calculate_trade_cost精确计算成本
+        while shares >= 100:
+            # 使用calculate_trade_cost计算实际交易成本（包括滑点）
+            actual_price, trade_cost = trade_manager.calculate_trade_cost(
+                price=price,
+                volume=shares,
+                direction="buy",
+                stock_code=stock_code
+            )
+            
+            # 计算总花费（实际价格 * 数量 + 交易成本）
+            total_cost = actual_price * shares + trade_cost
+
+            if total_cost <= usable_cash:
+                logging.info(f"计算买入量: 股票={stock_code}, 原始价格={price:.2f}, 考虑滑点后价格={actual_price:.2f}, "
+                           f"可用现金={available_cash:.2f}, 使用比例={cash_ratio:.2f}, "
+                           f"计划买入={shares}, 成本={trade_cost:.2f}, 总花费={total_cost:.2f}")
+                return int(shares) # 确保返回整数
+
+            shares -= 100 # 减少一手
+
+        return 0 # 循环结束仍未找到合适的买入量
+
+    except Exception as e:
+        logging.error(f"计算最大可买入数量时出错: {str(e)}", exc_info=True)
+        return 0
+
+def generate_signal(data: Dict, stock_code: str, price: float, ratio: float, action: str, reason: str = "") -> List[Dict]:
+    """
+    生成标准交易信号
+
+    Args:
+        data: 包含时间、账户、持仓信息的字典，以及框架信息 __framework__
+        stock_code: 股票代码
+        price: 交易价格
+        ratio: 当ratio≤1时表示交易比例(买入时指占剩余现金比例，卖出时指占可卖持仓比例)
+               当ratio>1时表示买入的股数（必须是100的整数倍）
+        action: 'buy' 或 'sell'
+        reason: 交易原因
+
+    Returns:
+        List[Dict]: 包含单个信号的列表，或空列表
+    """
+    signals = []
+    current_time = data.get("__current_time__", {})
+    timestamp = current_time.get("timestamp")
+    
+    # 对价格进行四舍五入处理，保留2位小数（A股价格精度为分）
+    price = round(price, 2)
+
+    if action == "buy":
+        # 判断ratio是否大于1，若大于1则表示买入股数
+        if ratio > 1:
+            # 检查股数是否为整百
+            target_volume = int(ratio)
+            if target_volume % 100 != 0:
+                error_msg = f"买入股数必须是100的整数倍: 股票={stock_code}, 输入股数={target_volume}"
+                logging.error(error_msg)
+                return []
+            
+            # 计算最大可买入量进行验证
+            max_volume = calculate_max_buy_volume(data, stock_code, price, cash_ratio=1.0)
+            if max_volume == 0:
+                logging.warning(f"无法生成买入信号: 股票={stock_code}, 价格={price:.2f}, 目标股数={target_volume}, 但资金不足无法买入")
+                return []
+            elif target_volume > max_volume:
+                logging.warning(f"目标买入量超过最大可买入量: 股票={stock_code}, 目标={target_volume}, 最大可买={max_volume}, 将调整为最大可买入量")
+                actual_volume = max_volume
+            else:
+                actual_volume = target_volume
+                
+            signal = {
+                "code": stock_code,
+                "action": "buy",
+                "price": price,  # 价格已在函数开始时四舍五入
+                "volume": actual_volume,
+                "reason": reason or f"按价格 {price:.2f} 买入 {actual_volume}股({actual_volume//100}手)"
+            }
+            if timestamp:
+                signal["timestamp"] = timestamp
+            signals.append(signal)
+            logging.info(f"生成买入信号: {signal}")
+        else:
+            # ratio <= 1时按照资金比例计算可买入股数
+            max_volume = calculate_max_buy_volume(data, stock_code, price, cash_ratio=ratio)
+            if max_volume > 0:
+                signal = {
+                    "code": stock_code,
+                    "action": "buy",
+                    "price": price,  # 价格已在函数开始时四舍五入
+                    "volume": max_volume,
+                    "reason": reason or f"按价格 {price:.2f} 以 {ratio*100:.0f}% 资金比例买入"
+                }
+                if timestamp:
+                    signal["timestamp"] = timestamp
+                signals.append(signal)
+                logging.info(f"生成买入信号: {signal}")
+            else:
+                logging.warning(f"无法生成买入信号: 股票={stock_code}, 价格={price:.2f}, 资金比例={ratio:.2f}, 计算可买量为0")
+
+    elif action == "sell":
+        positions_info = data.get("__positions__", {})
+        if stock_code in positions_info:
+            # 获取可卖数量，优先使用 'can_use_volume'，否则用 'volume'
+            position_data = positions_info[stock_code]
+            available_volume = position_data.get("can_use_volume", position_data.get("volume", 0))
+
+            if available_volume > 0:
+                # 计算要卖出的股数 (向下取整到100的倍数)
+                sell_volume = math.floor((available_volume * ratio) / 100) * 100
+                if sell_volume > 0:
+                    signal = {
+                        "code": stock_code,
+                        "action": "sell",
+                        "price": price,  # 价格已在函数开始时四舍五入
+                        "volume": int(sell_volume), # 确保是整数
+                        "reason": reason or f"按价格 {price:.2f} 卖出 {ratio*100:.0f}% 可用持仓"
+                    }
+                    if timestamp:
+                        signal["timestamp"] = timestamp
+                    signals.append(signal)
+                    logging.info(f"生成卖出信号: {signal}")
+                else:
+                    logging.warning(f"无法生成卖出信号: 股票={stock_code}, 价格={price:.2f}, 持仓比例={ratio:.2f}, 计算可卖量为0 (可用持仓={available_volume})")
+            else:
+                logging.warning(f"无法生成卖出信号: 股票={stock_code} 无可用持仓")
+        else:
+            logging.warning(f"无法生成卖出信号: 股票={stock_code} 不在持仓中")
+
+    return signals
 
 def read_stock_csv(file_path):
     """
@@ -103,7 +609,7 @@ def process_row(row, stock_codes, stock_names):
         else:
             logging.info(f"跳过股票（无交易所后缀）: {stock_code}")
 
-def download_and_store_data(local_data_path, stock_files, field_list, period_type, start_date, end_date, dividend_type='none', time_range='all', progress_callback=None, log_callback=None):
+def download_and_store_data(local_data_path, stock_files, field_list, period_type, start_date, end_date, dividend_type='none', time_range='all', progress_callback=None, log_callback=None, check_interrupt=None):
     """
     下载并存储指定股票、字段、周期类型和时间段的数据到文件。
 
@@ -200,6 +706,10 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
       - 该函数用于记录处理过程中的日志信息。
       - 接受一个字符串参数，表示日志消息。
       - 可用于在GUI中显示处理状态等。
+    
+    - check_interrupt (function, optional): 中断检查函数。
+      - 该函数用于检查是否需要中断下载过程。
+      - 返回True表示需要中断，返回False表示继续执行。
 
     返回值:
     - 无返回值，数据直接保存到指定目录。
@@ -208,11 +718,17 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
     - 如果股票代码文件不存在或格式错误，会记录警告并跳过。
     - 如果数据下载失败，会记录错误并继续处理下一只股票。
     - 如果保存文件失败，会记录错误信息。
+    - 如果中断检查函数返回True，会抛出InterruptedError异常。
     """
     try:
         # 获取所有股票代码
         stocks = []
         for stock_file in stock_files:
+            # 检查是否需要中断
+            if check_interrupt and check_interrupt():
+                logging.info("下载过程被中断")
+                raise InterruptedError("下载过程被用户中断")
+                
             if os.path.exists(stock_file):
                 logging.info(f"读取股票文件: {stock_file}")
                 codes, names = read_stock_csv(stock_file)
@@ -226,6 +742,11 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
         total_stocks = len(stocks)
         for index, stock in enumerate(stocks, 1):
             try:
+                # 检查是否需要中断
+                if check_interrupt and check_interrupt():
+                    logging.info("下载过程被中断")
+                    raise InterruptedError("下载过程被用户中断")
+                    
                 if log_callback:
                     log_callback(f"正在处理 {stock} ({index}/{total_stocks})")
 
@@ -234,11 +755,22 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
                                    "000300.SH", "000905.SH", "000852.SH"]
 
                 try:
+                    # 每次主要操作前检查中断
+                    if check_interrupt and check_interrupt():
+                        logging.info("下载过程被中断")
+                        raise InterruptedError("下载过程被用户中断")
+                        
                     if is_index:
                         # 指数数据处理
                         logging.info(f"获取指数数据: {stock}")
                         xtdata.download_history_data(stock, period=period_type, 
                                                    start_time=start_date, end_time=end_date)
+                        
+                        # 再次检查中断
+                        if check_interrupt and check_interrupt():
+                            logging.info("下载过程被中断")
+                            raise InterruptedError("下载过程被用户中断")
+                            
                         data = xtdata.get_market_data_ex(
                             field_list=['time'] + field_list,
                             stock_list=[stock],
@@ -259,6 +791,12 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
                         logging.info(f"获取股票数据: {stock}")
                         xtdata.download_history_data(stock, period=period_type, 
                                                    start_time=start_date, end_time=end_date)
+                        
+                        # 再次检查中断
+                        if check_interrupt and check_interrupt():
+                            logging.info("下载过程被中断")
+                            raise InterruptedError("下载过程被用户中断")
+                            
                         data = xtdata.get_local_data(  
                             field_list=['time'] + field_list,
                             stock_list=[stock],
@@ -270,8 +808,22 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
                         )
                         df = data[stock]
 
+                    # 检查中断
+                    if check_interrupt and check_interrupt():
+                        logging.info("下载过程被中断")
+                        raise InterruptedError("下载过程被用户中断")
+                        
                     # 开始数据处理和保存
                     logging.debug(f"准备处理数据 - 股票代码: {stock}")
+                    
+                    # 检查df是否为DataFrame类型
+                    if not isinstance(df, pd.DataFrame):
+                        error_msg = f"处理 {stock} 数据失败: 返回的数据不是DataFrame格式"
+                        logging.error(error_msg)
+                        if log_callback:
+                            log_callback(error_msg)
+                        continue
+                        
                     logging.debug(f"原始数据形状: {df.shape}")
                     logging.debug(f"原始数据列: {df.columns.tolist()}")
                     
@@ -296,6 +848,11 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
                         df["time"] = df["time"].dt.strftime("%H:%M:%S")
                         df = df[["date", "time"] + field_list]
 
+                    # 检查中断
+                    if check_interrupt and check_interrupt():
+                        logging.info("下载过程被中断")
+                        raise InterruptedError("下载过程被用户中断")
+                        
                     # 保存数据
                     logging.debug(f"准备保存数据 - 股票代码: {stock}")
                     logging.debug(f"处理后数据形状: {df.shape}")
@@ -312,18 +869,39 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
                         df.to_csv(file_path, index=False)
                         logging.info(f"文件保存成功: {file_path}")
                         
-                        # 验证文件是否成功保存
+                        # 验证文件是否成功保存并获取更多信息
                         if os.path.exists(file_path):
                             file_size = os.path.getsize(file_path)
-                            logging.info(f"已保存文件大小: {file_size} 字节")
+                            # 获取文件大小的可读形式
+                            if file_size < 1024:
+                                readable_size = f"{file_size} 字节"
+                            elif file_size < 1024 * 1024:
+                                readable_size = f"{file_size/1024:.2f} KB"
+                            else:
+                                readable_size = f"{file_size/(1024*1024):.2f} MB"
+                                
+                            # 获取行数和列数信息
+                            rows_count = len(df)
+                            cols_count = len(df.columns)
+                            
+                            logging.info(f"已保存文件信息: 大小={readable_size}, 行数={rows_count}, 列数={cols_count}")
+                            
+                            # 通过log_callback提供详细信息
+                            if log_callback:
+                                file_info = f"{stock} {period_type} 数据已存储: 文件大小={readable_size}, 行数={rows_count}, 列数={cols_count}, 路径: {file_path}"
+                                log_callback(file_info)
                         else:
                             logging.error(f"文件保存失败: {file_path}")
-                            
-                        if log_callback:
-                            log_callback(f"{stock} {period_type} 数据已存储到: {file_path}")
+                            if log_callback:
+                                log_callback(f"保存失败: {file_path}")
                     else:
                         logging.warning(f"股票 {stock} 的数据为空，跳过保存")
+                        if log_callback:
+                            log_callback(f"股票 {stock} 的数据为空，跳过保存")
 
+                except InterruptedError:
+                    logging.info(f"处理{stock}时被中断")
+                    raise
                 except Exception as e:
                     logging.error(f"处理{stock}时出错: {str(e)}", exc_info=True)
                     raise
@@ -331,8 +909,16 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
                 if progress_callback:
                     progress_callback(int(index / total_stocks * 100))
                 
+                # 检查中断
+                if check_interrupt and check_interrupt():
+                    logging.info("下载过程被中断")
+                    raise InterruptedError("下载过程被用户中断")
+                    
                 time.sleep(1)  # 添加延迟避免请求过快
 
+            except InterruptedError:
+                logging.info(f"处理股票 {stock} 时被用户中断")
+                raise
             except Exception as e:
                 logging.error(f"处理股票 {stock} 时出错: {str(e)}", exc_info=True)
                 raise
@@ -340,6 +926,9 @@ def download_and_store_data(local_data_path, stock_files, field_list, period_typ
         if log_callback:
             log_callback("数据下载和存储完成.")
 
+    except InterruptedError:
+        logging.info("下载和存储过程被用户中断")
+        raise
     except Exception as e:
         logging.error(f"下载存储数据时出错: {str(e)}", exc_info=True)
         raise
@@ -734,20 +1323,46 @@ def save_stock_list_to_csv(stock_dict, output_dir):
         raise
 
 def get_and_save_stock_list(output_dir):
-
     """获取并保存股票列表的便捷函数，返回更新线程实例"""
-    update_thread = StockListUpdateThread(output_dir)
-    update_thread.start()
-    return update_thread
-class StockListUpdateThread(QThread):
-    """股票列表更新线程"""
-    progress = pyqtSignal(str)  # 用于发送进度信息
-    finished = pyqtSignal(bool, str)  # 用于发送完成状态和消息
+    # 检查是否在主进程中
+    if not is_subprocess():
+        update_thread = StockListUpdateThread(output_dir)
+        update_thread.start()
+        return update_thread
+    else:
+        # 在子进程中直接执行，不使用Qt线程
+        try:
+            xtdata.download_sector_data()
+            stock_dict = get_stock_list()
+            save_stock_list_to_csv(stock_dict, output_dir)
+            return True, "股票列表更新成功！"
+        except Exception as e:
+            error_msg = f"更新股票列表时出错: {str(e)}"
+            logging.error(error_msg, exc_info=True)
+            return False, error_msg
+# 只在主进程中定义Qt线程类
+if not is_subprocess():
+    class StockListUpdateThread(QThread):
+        """股票列表更新线程"""
+        progress = pyqtSignal(str)  # 用于发送进度信息
+        finished = pyqtSignal(bool, str)  # 用于发送完成状态和消息
 
-    def __init__(self, output_dir):
-        super().__init__()
-        self.output_dir = output_dir
-        self.running = True
+        def __init__(self, output_dir):
+            super().__init__()
+            self.output_dir = output_dir
+            self.running = True
+else:
+    # 在子进程中创建空的占位符类
+    class StockListUpdateThread:
+        def __init__(self, output_dir):
+            self.output_dir = output_dir
+            self.running = True
+        
+        def start(self):
+            pass
+        
+        def run(self):
+            pass
 
     def run(self):
         try:
@@ -921,7 +1536,7 @@ class StockListUpdateThread(QThread):
                 for stock in stocks:
                     f.write(f"{stock['code']},{stock['name']}\n")
 
-def supplement_history_data(stock_files, field_list, period_type, start_date, end_date, dividend_type='none', time_range='all', progress_callback=None, log_callback=None):
+def supplement_history_data(stock_files, field_list, period_type, start_date, end_date, dividend_type='none', time_range='all', progress_callback=None, log_callback=None, check_interrupt=None):
     """
     补充历史行情数据。
 
@@ -940,11 +1555,23 @@ def supplement_history_data(stock_files, field_list, period_type, start_date, en
     - time_range (str): 要读取的时间段,格式为 "HH:MM-HH:MM"，默认为 "all"
     - progress_callback (function): 用于更新进度的回调函数
     - log_callback (function): 用于记录日志的回调函数
+    - check_interrupt (function, optional): 中断检查函数
+        - 该函数用于检查是否需要中断数据补充过程
+        - 返回True表示需要中断，返回False表示继续执行
     """
+    # 在函数开始时设置环境变量，防止意外启动Qt应用（仅在子进程中）
+    if is_subprocess():
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+    
     try:
         # 获取所有股票代码
         stocks = []
         for stock_file in stock_files:
+            # 检查是否需要中断
+            if check_interrupt and check_interrupt():
+                logging.info("补充数据过程被中断")
+                raise InterruptedError("补充数据过程被用户中断")
+                
             if os.path.exists(stock_file):
                 logging.info(f"读取股票文件: {stock_file}")
                 codes, names = read_stock_csv(stock_file)
@@ -958,9 +1585,19 @@ def supplement_history_data(stock_files, field_list, period_type, start_date, en
         total_stocks = len(stocks)
         for index, stock in enumerate(stocks, 1):
             try:
+                # 检查是否需要中断
+                if check_interrupt and check_interrupt():
+                    logging.info("补充数据过程被中断")
+                    raise InterruptedError("补充数据过程被用户中断")
+                    
                 if log_callback:
                     log_callback(f"正在补充 {stock} 的数据 ({index}/{total_stocks})")
 
+                # 检查是否需要中断
+                if check_interrupt and check_interrupt():
+                    logging.info("补充数据过程被中断")
+                    raise InterruptedError("补充数据过程被用户中断")
+                    
                 # 调用download_history_data进行数据补充
                 xtdata.download_history_data(
                     stock,
@@ -970,8 +1607,14 @@ def supplement_history_data(stock_files, field_list, period_type, start_date, en
                     incrementally=True
                 )
 
+                # 检查是否需要中断
+                if check_interrupt and check_interrupt():
+                    logging.info("补充数据过程被中断")
+                    raise InterruptedError("补充数据过程被用户中断")
+                    
+                    
                 # 获取数据（带复权参数）
-                data = xtdata.get_market_data(
+                data = xtdata.get_market_data_ex(
                     field_list=field_list,
                     stock_list=[stock],
                     period=period_type,
@@ -981,16 +1624,64 @@ def supplement_history_data(stock_files, field_list, period_type, start_date, en
                     fill_data=True
                 )
 
+                # 添加更详细的数据信息
+                if stock in data and data[stock] is not None:
+                    df = data[stock]
+                    
+                    # 检查df是否为DataFrame类型
+                    is_dataframe = isinstance(df, pd.DataFrame)
+                    
+                    # 获取数据信息
+                    rows_count = len(df) if df is not None else 0
+                    cols_count = len(df.columns) if is_dataframe else 0
+                    
+                    if rows_count > 0:
+                        # 计算时间跨度
+                        if is_dataframe and 'time' in df.columns:
+                            try:
+                                times = pd.to_datetime(df['time'].astype(float), unit='ms')
+                                min_time = times.min()
+                                max_time = times.max()
+                                time_span = f"{min_time.strftime('%Y-%m-%d')} 至 {max_time.strftime('%Y-%m-%d')}"
+                                
+                                # 输出详细信息
+                                if log_callback:
+                                    data_info = f"补充 {stock} 数据成功: 获取 {rows_count} 行, {cols_count} 列, 时间跨度: {time_span}"
+                                    log_callback(data_info)
+                            except Exception as e:
+                                if log_callback:
+                                    log_callback(f"补充 {stock} 数据完成，但获取详细信息时出错: {str(e)}")
+                        else:
+                            if log_callback:
+                                log_callback(f"补充 {stock} 数据成功: 获取 {rows_count} 行, {cols_count} 列")
+                    else:
+                        if log_callback:
+                            log_callback(f"补充 {stock} 数据成功，但数据为空")
+                else:
+                    if log_callback:
+                        log_callback(f"未能获取 {stock} 的数据")
+
                 if progress_callback:
                     progress = int((index / total_stocks) * 100)
                     progress_callback(progress)
 
+                # 检查是否需要中断
+                if check_interrupt and check_interrupt():
+                    logging.info("补充数据过程被中断")
+                    raise InterruptedError("补充数据过程被用户中断")
+
+            except InterruptedError:
+                logging.info(f"补充 {stock} 数据时被中断")
+                raise
             except Exception as e:
                 error_msg = f"补充 {stock} 数据时出错: {str(e)}"
                 logging.error(error_msg)
                 if log_callback:
                     log_callback(error_msg)
 
+    except InterruptedError:
+        logging.info("补充数据过程被用户中断")
+        raise
     except Exception as e:
         error_msg = f"补充数据时出错: {str(e)}"
         logging.error(error_msg, exc_info=True)
@@ -998,35 +1689,621 @@ def supplement_history_data(stock_files, field_list, period_type, start_date, en
             log_callback(error_msg)
         raise
 
-# 使用示例
-if __name__ == '__main__':
-    from PyQt5.QtWidgets import QApplication
-    import sys
+def get_stock_names(stock_codes, stock_list_file):
+    """
+    从股票列表文件中查询股票名称
     
-    # 配置日志
-    logging.basicConfig(level=logging.INFO,
-                      format='%(asctime)s - %(levelname)s - %(message)s')
+    Args:
+        stock_codes (list): 股票代码列表
+        stock_list_file (str): 股票列表文件路径
     
-    # 创建Qt应用（必需的，即使是命令行运行）
-    app = QApplication(sys.argv)
+    Returns:
+        dict: 股票代码到股票名称的映射字典
+    """
+    stock_names = {}
+    try:
+        with open(stock_list_file, 'r', encoding='utf-8-sig') as f:  # 使用utf-8-sig处理BOM
+            for line in f:
+                if line.strip():
+                    parts = line.strip().split(',')
+                    if len(parts) >= 2:
+                        code = parts[0].strip()
+                        name = parts[1].strip()
+                        if code in stock_codes:
+                            stock_names[code] = name
+    except Exception as e:
+        logging.error(f"读取股票列表文件出错: {str(e)}")
     
-    # 设置输出目录
-    output_dir = "stock_lists"
+    return stock_names
+
+def khHistory(symbol_list, fields, bar_count, fre_step, current_time=None, skip_paused=False, fq='pre', force_download=False):
+    """
+    获取股票历史数据（不包含当前时间点）
     
-    # 创建更新线程
-    update_thread = get_and_save_stock_list(output_dir)
+    参数:
+        symbol_list: 股票代码列表或单个股票代码字符串
+        fields: 数据字段列表，如['open', 'high', 'low', 'close', 'volume', 'amount']
+        bar_count: 获取的K线数量
+        fre_step: 时间频率，如'1d', '1m', '5m'等
+        current_time: 当前时间，支持多种格式：
+                     - 日线数据：'YYYYMMDD' 或 'YYYY-MM-DD'
+                     - 分钟/tick数据：'YYYYMMDD HHMMSS' 或 'YYYY-MM-DD HH:MM:SS'
+                     - 如果为None则使用当前日期时间
+        skip_paused: 是否跳过停牌数据，True跳过，False不跳过
+        fq: 复权方式，'pre'前复权, 'post'后复权, 'none'不复权
+        force_download: 是否强制下载最新数据，True强制下载，False使用本地缓存
     
-    # 添加进度显示
-    def show_progress(msg):
-        print(f"进度: {msg}")
+    返回:
+        dict: {股票代码: DataFrame}，DataFrame包含time列和指定的数据字段
+        
+    注意: 返回的数据不包含current_time这个时间点，确保回测逻辑正确
+    """
     
-    def handle_finished(success, message):
-        print(f"完成: {'成功' if success else '失败'} - {message}")
-        app.quit()  # 完成后退出应用
+    # 导入必要的模块
+    try:
+        from xtquant import xtdata
+        import pandas as pd
+        from datetime import datetime, timedelta
+    except ImportError as e:
+        print(f"导入模块失败: {str(e)}")
+        return {}
     
-    # 连接信号
-    update_thread.progress.connect(show_progress)
-    update_thread.finished.connect(handle_finished)
+    # 参数验证
+    if not symbol_list:
+        raise ValueError("symbol_list不能为空")
+    if not fields:
+        raise ValueError("fields不能为空")
+    if bar_count <= 0:
+        raise ValueError("bar_count必须大于0")
     
-    # 启动事件循环
-    sys.exit(app.exec_())
+    # 统一处理股票代码列表
+    if isinstance(symbol_list, str):
+        stock_codes = [symbol_list]
+    else:
+        stock_codes = list(symbol_list)
+    
+    # 处理当前时间
+    current_datetime = None
+    current_date_str = None
+    
+    if current_time is None:
+        # 如果没有指定时间，使用当前时间
+        current_datetime = datetime.now()
+        current_date_str = current_datetime.strftime('%Y%m%d')
+    else:
+        # 解析输入的时间格式
+        if isinstance(current_time, str):
+            current_time = current_time.strip()
+            
+            # 尝试解析不同的时间格式
+            time_formats = [
+                '%Y%m%d %H%M%S',     # YYYYMMDD HHMMSS
+                '%Y-%m-%d %H:%M:%S', # YYYY-MM-DD HH:MM:SS
+                '%Y%m%d',            # YYYYMMDD
+                '%Y-%m-%d'           # YYYY-MM-DD
+            ]
+            
+            for fmt in time_formats:
+                try:
+                    current_datetime = datetime.strptime(current_time, fmt)
+                    break
+                except ValueError:
+                    continue
+            
+            if current_datetime is None:
+                raise ValueError(f"无法解析时间格式: {current_time}，支持的格式: YYYYMMDD, YYYY-MM-DD, YYYYMMDD HHMMSS, YYYY-MM-DD HH:MM:SS")
+            
+            current_date_str = current_datetime.strftime('%Y%m%d')
+        else:
+            raise ValueError("current_time必须是字符串格式")
+    
+    #print(f"解析的当前时间: {current_datetime.strftime('%Y-%m-%d %H:%M:%S')} (不包含此时间点)")
+    
+    # 转换复权方式
+    dividend_type_map = {
+        'pre': 'front',
+        'post': 'back', 
+        'none': 'none'
+    }
+    dividend_type = dividend_type_map.get(fq, 'front')
+    
+    # 转换时间步长格式
+    period_map = {
+        '1d': '1d',
+        '1m': '1m',
+        '5m': '5m',
+        'tick': 'tick'
+    }
+    period = period_map.get(fre_step, fre_step)
+    
+    result = {}
+    
+    try:
+        if force_download:
+            # 强制下载模式：先下载最新数据到指定时间，再获取
+            print(f"强制下载模式：基于时间 {current_date_str} 下载最新数据")
+            
+            # 根据当前时间和bar_count计算开始时间
+            start_date = None
+            try:
+                # 根据数据类型确定需要的历史天数
+                if period == 'tick':
+                    # tick数据只需要当天的数据，但要向前多取一些天以防当天无数据
+                    target_days = 3
+                elif period in ['1m', '5m']:
+                    # 分钟数据，计算需要的天数，增加缓冲
+                    target_days = max(10, (bar_count * 10 + 1439) // 1440)  # 增加缓冲
+                elif period in ['1d']:
+                    # 日线数据，增加缓冲天数
+                    target_days = bar_count * 5  # 增加缓冲
+                else:
+                    target_days = bar_count * 3
+                
+                # 计算开始日期（往前推target_days天）
+                start_dt = current_datetime - timedelta(days=target_days)
+                start_date = start_dt.strftime('%Y%m%d')
+                
+                print(f"计算的数据范围: {start_date} 到 {current_date_str}")
+                
+            except Exception as e:
+                print(f"计算时间范围出错: {str(e)}")
+                # 如果计算失败，使用默认的往前推算逻辑
+                start_dt = current_datetime - timedelta(days=bar_count * 5)
+                start_date = start_dt.strftime('%Y%m%d')
+            
+            # 使用xtdata.download_history_data下载数据到指定时间
+            download_count = 0
+            for stock_code in stock_codes:
+                try:
+                    xtdata.download_history_data(
+                        stock_code=stock_code,
+                        period=period,
+                        start_time=start_date,
+                        end_time=current_date_str
+                    )
+                    download_count += 1
+                except Exception as e:
+                    print(f"下载 {stock_code} 数据失败: {str(e)}")
+            
+            print(f"成功下载 {download_count}/{len(stock_codes)} 只股票的数据")
+        
+        # 使用xtdata.get_market_data_ex获取数据
+        #print(f"从本地获取数据，基于时间: {current_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 计算实际的数据获取范围
+        # 根据频率确定往前推算的天数，增加缓冲以确保有足够的历史数据
+        if period == 'tick':
+            # tick数据只获取当天的，但向前多取几天
+            lookback_days = 3
+        elif period in ['1m', '5m']:
+            # 分钟数据，往前推算较多天数以确保有足够数据
+            lookback_days = max(10, (bar_count * 10 + 1439) // 1440)  # 增加缓冲
+        elif period in ['1d']:
+            # 日线数据，往前推算更多天数以确保有足够的交易日
+            lookback_days = bar_count * 5  # 增加缓冲
+        else:
+            lookback_days = bar_count * 3
+        
+        start_dt = current_datetime - timedelta(days=lookback_days)
+        start_time = start_dt.strftime('%Y%m%d')
+        end_time = current_date_str
+        
+        #print(f"实际查询范围: {start_time} 到 {end_time}")
+        
+        # 获取数据
+        data = xtdata.get_market_data_ex(
+            field_list=['time'] + fields,
+            stock_list=stock_codes,
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type=dividend_type,
+            fill_data=True
+        )
+        
+        if not data:
+            print("未获取到任何数据")
+            return {}
+        
+        # 处理每只股票的数据
+        for stock_code in stock_codes:
+            if stock_code not in data:
+                print(f"警告: 股票 {stock_code} 无数据")
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            stock_data = data[stock_code]
+            
+            if stock_data is None or stock_data.empty:
+                print(f"警告: 股票 {stock_code} 数据为空")
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            # 复制数据避免修改原始数据
+            stock_data = stock_data.copy()
+            
+            # 处理时间列
+            if 'time' in stock_data.columns:
+                # 转换时间列
+                stock_data['time'] = pd.to_datetime(stock_data['time'].astype(float), unit='ms') + pd.Timedelta(hours=8)
+                
+                # 筛选到指定时间之前的数据（不包含当前时间点）
+                if period == 'tick':
+                    # tick数据按精确时间筛选，不包含当前时间点
+                    mask = stock_data['time'] < current_datetime
+                elif period in ['1m', '5m']:
+                    # 分钟数据按精确时间筛选，不包含当前时间点
+                    mask = stock_data['time'] < current_datetime
+                else:
+                    # 日线数据只比较日期部分，不包含当前日期
+                    mask = stock_data['time'].dt.date < current_datetime.date()
+                
+                stock_data = stock_data[mask]
+                
+                # 按时间排序
+                stock_data = stock_data.sort_values('time').reset_index(drop=True)
+            
+            # 跳过停牌数据处理
+            if skip_paused and 'volume' in stock_data.columns:
+                # 过滤掉成交量为0的数据（停牌日）
+                original_len = len(stock_data)
+                stock_data = stock_data[stock_data['volume'] > 0].reset_index(drop=True)
+                filtered_len = len(stock_data)
+                if original_len != filtered_len:
+                    print(f"股票 {stock_code} 过滤停牌数据: {original_len} -> {filtered_len}")
+            
+            # 取最近的bar_count条记录
+            if not stock_data.empty and len(stock_data) > bar_count:
+                stock_data = stock_data.tail(bar_count).reset_index(drop=True)
+            
+            # 重新整理列顺序，确保time列在前
+            columns_order = ['time'] + [col for col in fields if col in stock_data.columns]
+            stock_data = stock_data[columns_order]
+            
+            result[stock_code] = stock_data
+            #print(f"股票 {stock_code}: 获取 {len(stock_data)} 条记录")
+            
+            # 显示时间范围
+            if not stock_data.empty and 'time' in stock_data.columns:
+                time_range = f"{stock_data['time'].min()} 到 {stock_data['time'].max()}"
+                #print(f"  时间范围: {time_range}")
+                
+                # 验证数据确实不包含当前时间点
+                if period in ['1d']:
+                    latest_date = stock_data['time'].dt.date.max()
+                    if latest_date >= current_datetime.date():
+                        print(f"  ⚠️ 警告: 数据包含当前日期或之后的日期")
+                else:
+                    latest_time = stock_data['time'].max()
+                    if latest_time >= current_datetime:
+                        print(f"  ⚠️ 警告: 数据包含当前时间或之后的时间")
+    
+    except Exception as e:
+        print(f"获取历史数据时出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {}
+    
+    return result
+
+
+def test_khHistory():
+    """测试khHistory函数的各种参数组合"""
+    print("开始测试khHistory函数...")
+    print("=" * 50)
+    
+    # 测试1: 基本功能测试（使用当前时间）
+    print("\n测试1: 基本功能测试（当前时间）")
+    print("-" * 40)
+    try:
+        result1 = khHistory(
+            symbol_list='000001.SZ',
+            fields=['open', 'close', 'volume'],
+            bar_count=10,
+            fre_step='1d',
+            force_download=True
+        )
+        if '000001.SZ' in result1 and not result1['000001.SZ'].empty:
+            df = result1['000001.SZ']
+            print(f"✓ 当前时间测试: 获取 {len(df)} 条记录")
+            print(f"  列名: {list(df.columns)}")
+            if 'time' in df.columns:
+                time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                print(f"  时间范围: {time_range}")
+                # 验证不包含当前日期
+                from datetime import datetime
+                today = datetime.now().date()
+                latest_date = df['time'].dt.date.max()
+                if latest_date < today:
+                    print(f"  ✓ 验证通过: 数据不包含当前日期 {today}")
+                else:
+                    print(f"  ✗ 验证失败: 数据包含当前日期或之后的日期")
+        else:
+            print("✗ 当前时间测试: 未获取到数据")
+    except Exception as e:
+        print(f"✗ 当前时间测试: 出错 - {str(e)}")
+    
+    # 测试2: 指定历史日期测试
+    print("\n测试2: 指定历史日期测试")
+    print("-" * 40)
+    test_dates = ['20241201', '2024-12-01', '20241115']
+    
+    for test_date in test_dates:
+        try:
+            result2 = khHistory(
+                symbol_list='000001.SZ',
+                fields=['close', 'volume'],
+                bar_count=5,
+                fre_step='1d',
+                current_time=test_date,
+                force_download=True
+            )
+            if '000001.SZ' in result2 and not result2['000001.SZ'].empty:
+                df = result2['000001.SZ']
+                print(f"✓ 日期{test_date}: 获取 {len(df)} 条记录")
+                if 'time' in df.columns:
+                    time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                    print(f"  时间范围: {time_range}")
+                    # 验证不包含指定日期
+                    from datetime import datetime
+                    if '-' in test_date:
+                        target_date = datetime.strptime(test_date, '%Y-%m-%d').date()
+                    else:
+                        target_date = datetime.strptime(test_date, '%Y%m%d').date()
+                    latest_date = df['time'].dt.date.max()
+                    if latest_date < target_date:
+                        print(f"  ✓ 验证通过: 数据不包含目标日期 {target_date}")
+                    else:
+                        print(f"  ✗ 验证失败: 数据包含目标日期或之后的日期")
+            else:
+                print(f"✗ 日期{test_date}: 未获取到数据")
+        except Exception as e:
+            print(f"✗ 日期{test_date}: 出错 - {str(e)}")
+    
+    # 测试3: 指定精确时间测试（分钟数据）
+    print("\n测试3: 指定精确时间测试（分钟数据）")
+    print("-" * 40)
+    test_times = [
+        '20241201 143000',      # YYYYMMDD HHMMSS
+        '2024-12-01 14:30:00',  # YYYY-MM-DD HH:MM:SS
+        '20241201 100000',      # 上午10点
+        '2024-12-01 15:00:00'   # 下午3点
+    ]
+    
+    for test_time in test_times:
+        try:
+            result3 = khHistory(
+                symbol_list='000001.SZ',
+                fields=['close', 'volume'],
+                bar_count=10,
+                fre_step='5m',
+                current_time=test_time,
+                force_download=True
+            )
+            if '000001.SZ' in result3 and not result3['000001.SZ'].empty:
+                df = result3['000001.SZ']
+                print(f"✓ 时间{test_time}: 获取 {len(df)} 条记录")
+                if 'time' in df.columns:
+                    time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                    print(f"  时间范围: {time_range}")
+                    # 验证不包含指定时间
+                    from datetime import datetime
+                    if ' ' in test_time:
+                        if ':' in test_time:
+                            target_time = datetime.strptime(test_time, '%Y-%m-%d %H:%M:%S')
+                        else:
+                            target_time = datetime.strptime(test_time, '%Y%m%d %H%M%S')
+                    else:
+                        target_time = datetime.strptime(test_time, '%Y%m%d')
+                    
+                    latest_time = df['time'].max()
+                    if latest_time < target_time:
+                        print(f"  ✓ 验证通过: 数据不包含目标时间 {target_time}")
+                    else:
+                        print(f"  ✗ 验证失败: 数据包含目标时间或之后的时间")
+            else:
+                print(f"✗ 时间{test_time}: 未获取到数据")
+        except Exception as e:
+            print(f"✗ 时间{test_time}: 出错 - {str(e)}")
+    
+    # 测试4: 多股票测试（指定时间）
+    print("\n测试4: 多股票测试（指定时间）")
+    print("-" * 40)
+    try:
+        result4 = khHistory(
+            symbol_list=['000001.SZ', '600000.SH'],
+            fields=['close', 'volume'],
+            bar_count=3,
+            fre_step='1d',
+            current_time='20241201',
+            force_download=True
+        )
+        for stock_code in ['000001.SZ', '600000.SH']:
+            if stock_code in result4 and not result4[stock_code].empty:
+                df = result4[stock_code]
+                print(f"✓ {stock_code}: 获取 {len(df)} 条记录")
+            else:
+                print(f"✗ {stock_code}: 未获取到数据")
+    except Exception as e:
+        print(f"✗ 多股票测试: 出错 - {str(e)}")
+    
+    # 测试5: 跳过停牌数据测试（指定时间）
+    print("\n测试5: 跳过停牌数据测试（指定时间）")
+    print("-" * 40)
+    for skip in [False, True]:
+        try:
+            result5 = khHistory(
+                symbol_list='000001.SZ',
+                fields=['close', 'volume'],
+                bar_count=20,
+                fre_step='1d',
+                current_time='20241201',
+                skip_paused=skip,
+                force_download=True
+            )
+            if '000001.SZ' in result5 and not result5['000001.SZ'].empty:
+                df = result5['000001.SZ']
+                zero_volume_count = (df['volume'] == 0).sum()
+                print(f"✓ 跳过停牌={skip}: 获取 {len(df)} 条记录，其中成交量为0的有 {zero_volume_count} 条")
+            else:
+                print(f"✗ 跳过停牌={skip}: 未获取到数据")
+        except Exception as e:
+            print(f"✗ 跳过停牌={skip}: 出错 - {str(e)}")
+    
+    # 测试6: 强制下载性能测试（指定时间）
+    print("\n测试6: 强制下载性能测试（指定时间）")
+    print("-" * 40)
+    try:
+        import time
+        start_time = time.time()
+        
+        result6 = khHistory(
+            symbol_list='000001.SZ',
+            fields=['close', 'volume'],
+            bar_count=5,
+            fre_step='1d',
+            current_time='20241201',
+            force_download=True
+        )
+        
+        end_time = time.time()
+        elapsed_time = (end_time - start_time) * 1000  # 转换为毫秒
+        
+        if '000001.SZ' in result6 and not result6['000001.SZ'].empty:
+            df = result6['000001.SZ']
+            print(f"✓ 强制下载性能测试: 获取 {len(df)} 条记录，耗时 {elapsed_time:.1f}ms")
+            if 'time' in df.columns:
+                time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                print(f"  时间范围: {time_range}")
+        else:
+            print(f"✗ 强制下载性能测试: 未获取到数据，耗时 {elapsed_time:.1f}ms")
+    except Exception as e:
+        print(f"✗ 强制下载性能测试: 出错 - {str(e)}")
+    
+    # 测试7: 分钟数据精确时间控制测试
+    print("\n测试7: 分钟数据精确时间控制测试")
+    print("-" * 40)
+    minute_tests = [
+        ('1m', '2024-12-01 10:30:00', 30),   # 1分钟数据，获取30条
+        ('5m', '2024-12-01 14:30:00', 12),   # 5分钟数据，获取12条
+        ('1d', '20241201', 8)                # 日线数据，获取8条
+    ]
+    
+    for freq, test_time, count in minute_tests:
+        try:
+            result7 = khHistory(
+                symbol_list='000001.SZ',
+                fields=['close', 'volume'],
+                bar_count=count,
+                fre_step=freq,
+                current_time=test_time,
+                force_download=True
+            )
+            if '000001.SZ' in result7 and not result7['000001.SZ'].empty:
+                df = result7['000001.SZ']
+                print(f"✓ {freq}数据到{test_time}: 获取 {len(df)} 条记录")
+                if 'time' in df.columns:
+                    time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                    print(f"  时间范围: {time_range}")
+            else:
+                print(f"✗ {freq}数据到{test_time}: 未获取到数据")
+        except Exception as e:
+            print(f"✗ {freq}数据到{test_time}: 出错 - {str(e)}")
+    
+    # 测试8: 复权方式测试（指定时间）
+    print("\n测试8: 复权方式测试（指定时间）")
+    print("-" * 40)
+    for fq_type in ['none', 'pre', 'post']:
+        try:
+            result8 = khHistory(
+                symbol_list='000001.SZ',
+                fields=['close'],
+                bar_count=3,
+                fre_step='1d',
+                current_time='20241201',
+                fq=fq_type,
+                force_download=True
+            )
+            if '000001.SZ' in result8 and not result8['000001.SZ'].empty:
+                df = result8['000001.SZ']
+                close_prices = df['close'].tolist()
+                print(f"✓ 复权方式{fq_type}: 获取 {len(df)} 条记录，收盘价: {close_prices}")
+            else:
+                print(f"✗ 复权方式{fq_type}: 未获取到数据")
+        except Exception as e:
+            print(f"✗ 复权方式{fq_type}: 出错 - {str(e)}")
+    
+    # 测试9: 时间边界验证测试
+    print("\n测试9: 时间边界验证测试")
+    print("-" * 40)
+    boundary_tests = [
+        ('20241201', '获取2024-12-01之前的数据'),
+        ('2024-12-01 09:30:00', '获取9:30之前的分钟数据'),
+        ('20241215 143000', '获取14:30之前的数据')
+    ]
+    
+    for time_str, desc in boundary_tests:
+        try:
+            is_minute = ' ' in time_str
+            freq = '5m' if is_minute else '1d'
+            
+            result9 = khHistory(
+                symbol_list='000001.SZ',
+                fields=['close'],
+                bar_count=5,
+                fre_step=freq,
+                current_time=time_str,
+                force_download=True
+            )
+            if '000001.SZ' in result9 and not result9['000001.SZ'].empty:
+                df = result9['000001.SZ']
+                print(f"✓ {desc}: 获取 {len(df)} 条记录")
+                if 'time' in df.columns and len(df) > 0:
+                    latest_time = df['time'].max()
+                    print(f"  最新时间: {latest_time}")
+                    
+                    # 解析目标时间进行验证
+                    from datetime import datetime
+                    if ':' in time_str:
+                        if '-' in time_str:
+                            target_time = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+                        else:
+                            target_time = datetime.strptime(time_str, '%Y%m%d %H%M%S')
+                    else:
+                        if '-' in time_str:
+                            target_time = datetime.strptime(time_str, '%Y-%m-%d')
+                        else:
+                            target_time = datetime.strptime(time_str, '%Y%m%d')
+                    
+                    if is_minute:
+                        # 分钟数据精确时间比较
+                        if latest_time < target_time:
+                            print(f"  ✓ 时间边界验证通过: {latest_time} < {target_time}")
+                        else:
+                            print(f"  ✗ 时间边界验证失败: {latest_time} >= {target_time}")
+                    else:
+                        # 日线数据按日期比较
+                        if latest_time.date() < target_time.date():
+                            print(f"  ✓ 日期边界验证通过: {latest_time.date()} < {target_time.date()}")
+                        else:
+                            print(f"  ✗ 日期边界验证失败: {latest_time.date()} >= {target_time.date()}")
+            else:
+                print(f"✗ {desc}: 未获取到数据")
+        except Exception as e:
+            print(f"✗ {desc}: 出错 - {str(e)}")
+    
+    print("\n" + "=" * 50)
+    print("khHistory函数测试完成（不包含当前时间点，适合回测场景）")
+
+
+# ============================================================================
+# 便利实例 - 为了向后兼容，创建一个默认实例
+# ============================================================================
+
+# 创建一个默认的工具实例，供旧代码兼容使用
+# 这样 `from khQTTools import KhQuTools; tools = KhQuTools()` 和 `from khQTTools import tools` 都能工作
+tools = KhQuTools()
+
+if __name__ == "__main__":
+    test_khHistory()
