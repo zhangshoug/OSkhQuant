@@ -1030,24 +1030,37 @@ class KhQuantFramework:
 
 是否继续运行回测？"""
 
-                # 显示弹窗提醒
+                # 使用QMetaObject.invokeMethod在主线程中显示弹窗
                 if self.trader_callback and hasattr(self.trader_callback, 'gui'):
-                    msg_box = QMessageBox(self.trader_callback.gui)
-                    msg_box.setIcon(QMessageBox.Warning)
-                    msg_box.setWindowTitle("周期不匹配警告")
-                    msg_box.setText(message)
-                    msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                    msg_box.setDefaultButton(QMessageBox.No)
+                    # 创建一个标志变量来存储用户选择
+                    user_choice = [None]  # 使用列表以便在lambda中修改
                     
-                    # 设置按钮文本
-                    yes_button = msg_box.button(QMessageBox.Yes)
-                    no_button = msg_box.button(QMessageBox.No)
-                    yes_button.setText("继续运行")
-                    no_button.setText("停止运行")
+                    def show_dialog():
+                        msg_box = QMessageBox(self.trader_callback.gui)
+                        msg_box.setIcon(QMessageBox.Warning)
+                        msg_box.setWindowTitle("周期不匹配警告")
+                        msg_box.setText(message)
+                        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                        msg_box.setDefaultButton(QMessageBox.No)
+                        
+                        # 设置按钮文本
+                        yes_button = msg_box.button(QMessageBox.Yes)
+                        no_button = msg_box.button(QMessageBox.No)
+                        yes_button.setText("继续运行")
+                        no_button.setText("停止运行")
+                        
+                        user_choice[0] = msg_box.exec_()
                     
-                    reply = msg_box.exec_()
+                    # 在主线程中执行弹窗显示
+                    QMetaObject.invokeMethod(
+                        self.trader_callback.gui,
+                        "invoke",
+                        Qt.BlockingQueuedConnection,
+                        Q_ARG("PyQt_PyObject", show_dialog)
+                    )
                     
-                    if reply == QMessageBox.No:
+                    # 处理用户选择
+                    if user_choice[0] == QMessageBox.No:
                         # 用户选择停止运行
                         if self.trader_callback:
                             self.trader_callback.gui.log_message("用户取消运行：数据周期与触发类型不匹配", "WARNING")

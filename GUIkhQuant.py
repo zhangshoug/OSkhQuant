@@ -3253,6 +3253,14 @@ class KhQuantGUI(QMainWindow):
         except Exception as e:
             self.log_error("处理策略错误回调时出错", e)
 
+    @pyqtSlot("PyQt_PyObject")
+    def invoke(self, func):
+        """在主线程中调用指定函数（用于跨线程安全调用）"""
+        try:
+            func()
+        except Exception as e:
+            self.log_message(f"执行跨线程调用时出错: {str(e)}", "ERROR")
+
     @pyqtSlot(str, str)
     def _update_status_table(self, time_str, content):
         """实际的状态表更新函数（在GUI线程中执行）"""
